@@ -1,4 +1,5 @@
 use crate::engine::Data;
+use crate::network::protocol::*;
 use bytes::BytesMut;
 use std::collections::HashMap;
 use std::str::from_utf8;
@@ -10,18 +11,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{info, info_span, span, warn, Instrument, Span};
 use tracing_subscriber::fmt::format;
 
-pub(crate) struct NetworkService {
+pub struct NetworkService {
     sender: NetworkingServiceController,
     runtime: Mutex<Option<Runtime>>,
 }
 
-type ChannelIdentifier = String;
-enum ProtocolControl {
-    NewDataChannel(ChannelIdentifier),
-}
 enum NetworkingServiceControl {
     Stop,
     RegisterChannel(ChannelIdentifier, EmitFn),
@@ -54,7 +51,7 @@ async fn channel_handler(emit: EmitFn, listener: TcpListener) -> Result<()> {
         }
     }
 }
-async fn create_channel_handler(emit: EmitFn) -> Result<u16> {
+async fn create_channel_handler(channel_id: ChannelIdentifier, emit: EmitFn) -> Result<u16> {
     let (tx, rx) = oneshot::channel::<std::result::Result<u16, ()>>();
     tokio::spawn(async move {
         let listener = TcpListener::bind("0.0.0.0:0").await;
@@ -68,7 +65,7 @@ async fn create_channel_handler(emit: EmitFn) -> Result<u16> {
             "Channel Handler terminated: {:?}",
             channel_handler(emit, listener).await
         );
-    });
+    }.instrument(info_span!("channel_handler", channel_id = %channel_id)));
 
     rx.await?
         .map_err(|_| "Could not create data channel listener".into())
@@ -87,7 +84,7 @@ async fn control_socket_handler(mut stream: TcpStream, channels: RegisteredChann
         let channel_id = channel_id.strip_suffix('\n').unwrap();
 
         if let Some(emit) = channels.write().await.remove(channel_id) {
-            let port = create_channel_handler(emit).await?;
+            let port = create_channel_handler(channel_id.into(), emit).await?;
             stream.write_all(format!("OK {port}\n").as_bytes()).await?;
         } else {
             stream.write_all(format!("NOT OK\n").as_bytes()).await?;
@@ -95,9 +92,9 @@ async fn control_socket_handler(mut stream: TcpStream, channels: RegisteredChann
     }
     Ok(())
 }
-async fn control_socket(mut control: NetworkingServiceControlListener) -> Result<()> {
+async fn control_socket(mut control: NetworkingServiceControlListener, port: u16) -> Result<()> {
     use tokio::net::*;
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     let registered_channels = Arc::new(tokio::sync::RwLock::new(HashMap::default()));
 
     info!("Control bound to {}", listener.local_addr().unwrap());
@@ -110,8 +107,9 @@ async fn control_socket(mut control: NetworkingServiceControlListener) -> Result
                     {
                         let channels = registered_channels.clone();
                         async move {
-                            info!("Control Socket Handler: {:?}", control_socket_handler(stream, channels).await);
-                        }
+                            info!("Starting Connection Handler");
+                            info!("Connection Handler terminated: {:?}", control_socket_handler(stream, channels).await);
+                        }.instrument(info_span!("connection", addr = %addr))
                     });
             },
             control_message = control.recv() => {
@@ -126,7 +124,7 @@ async fn control_socket(mut control: NetworkingServiceControlListener) -> Result
     Ok(())
 }
 impl NetworkService {
-    pub(crate) fn start(runtime: Runtime) -> Arc<NetworkService> {
+    pub fn start(runtime: Runtime, port: u16) -> Arc<NetworkService> {
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         let service = Arc::new(NetworkService {
             sender: tx,
@@ -141,7 +139,7 @@ impl NetworkService {
             .unwrap()
             .spawn(async move {
                 info!("Starting Control");
-                info!("Control stopped: {:?}", control_socket(rx).await)
+                info!("Control stopped: {:?}", control_socket(rx, port).await)
             });
 
         service
@@ -175,16 +173,4 @@ impl NetworkService {
         runtime.shutdown_timeout(Duration::from_secs(1));
         Ok(())
     }
-}
-
-#[test]
-fn basic_usage() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_io()
-        .build()
-        .unwrap();
-    let service = NetworkService::start(rt);
-
-    sleep(Duration::from_secs(100));
-    service.shutdown().unwrap();
 }

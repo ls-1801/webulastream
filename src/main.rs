@@ -2,14 +2,14 @@ mod engine;
 mod network;
 
 use crate::engine::{Data, ExecutablePipeline, Node, PipelineContext, SourceNode};
-use crate::network::EmitFn;
+use crate::network::receiver::EmitFn;
 use bytes::{Bytes, BytesMut};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use log::warn;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::hash_map::OccupiedEntry;
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Write};
 use std::str::from_utf8;
 use std::sync;
 use std::sync::Arc;
@@ -220,7 +220,14 @@ struct ChannelParameter {
 // }
 #[derive(Parser)]
 struct CLIArgs {
-    data_port: u16,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Receiver { num_channels: usize, data_port: u16 },
+    Sender { num_channels: usize, data_port: u16 },
 }
 
 struct NetworkSink {}
@@ -248,50 +255,57 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
+        .enable_time()
         .build()
         .unwrap();
-    let service = crate::network::NetworkService::start(rt);
-    service
-        .register_channel(
-            "hello".to_string(),
-            Box::new(|data| basic_emit(data)) as EmitFn,
-        )
-        .expect("Could not register channel");
 
-    sleep(Duration::from_secs(1));
-    service.shutdown().unwrap();
+    match args.command {
+        Commands::Receiver {
+            num_channels,
+            data_port,
+        } => {
+            let service = network::receiver::NetworkService::start(rt, data_port);
+            for channel_id in 0..num_channels {
+                service
+                    .register_channel(
+                        format!("hello{channel_id}"),
+                        Box::new(|data| basic_emit(data)) as EmitFn,
+                    )
+                    .expect("Could not register channel");
+            }
+            sleep(Duration::from_secs(100));
+            service.shutdown().unwrap();
+        }
+        Commands::Sender {
+            num_channels,
+            data_port,
+        } => {
+            let service = network::sender::NetworkService::start(rt);
 
-    // // let (tx, rx) = tokio::sync::mpsc::channel(20);
-    // // let server = Arc::new(IncomingServer { command: tx });
-    //
-    // let rt = tokio::runtime::Builder::new_multi_thread()
-    //     .enable_io()
-    //     .build()
-    //     .expect("Could not create rt");
-    //
-    // let port = args.data_port;
-    // // rt.spawn(async move {
-    // //     IncomingServer::run(rx, port).await.expect("Server Failed");
-    // // });
-    // //
-    // // rt.block_on(async {
-    // //     let mut channel = server.open("test".into()).await.expect("Yes");
-    // //     loop {
-    // //         let data = channel.rx.recv().await.expect("Could not get data");
-    // //         info!(
-    // //             "Received data from channel {}. Msg: {:?}",
-    // //             "test", data.bytes
-    // //         );
-    // //     }
-    // // });
-    //
-    // let engine = engine::QueryEngine::start();
-    // let sink = Node::new(None, Arc::new(NetworkSink {}));
-    //
-    // let id = engine.startQuery(engine::Query::new(vec![SourceNode::new(
-    //     sink,
-    //     Box::new(NetworkSource {}),
-    // )]));
-    // sleep(Duration::from_secs(5));
-    // engine.stopQuery(id);
+            let threads = threadpool::Builder::new().num_threads(50).build();
+            for channel_id in 0..num_channels {
+                threads.execute({
+                    let service = service.clone();
+                    move || {
+                        let channel = service
+                            .register_channel(data_port, format!("hello{channel_id}"))
+                            .unwrap();
+
+                        for i in (0..100) {
+                            sleep(Duration::from_millis(1000));
+                            let mut data = BytesMut::with_capacity(100);
+                            data.write_fmt(format_args!("This is a message {i}\n"))
+                                .unwrap();
+                            if let Err(e) = channel.send_blocking(Data { bytes: data }) {
+                                warn!("Error sending message to channel {e}");
+                            }
+                        }
+                    }
+                });
+            }
+            threads.join();
+
+            service.shutdown().unwrap();
+        }
+    }
 }
