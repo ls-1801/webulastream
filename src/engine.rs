@@ -124,8 +124,8 @@ impl PipelineContext for PEC<'_> {
 impl QueryEngine {
     pub(crate) fn start() -> Arc<QueryEngine> {
         let engine = Arc::new(QueryEngine::default());
-        let pool = ThreadPool::new(2);
-
+        let pool = ThreadPool::with_name("engine".to_string(), 2);
+        
         pool.execute({
             let engine = engine.clone();
             move || loop {
@@ -146,14 +146,14 @@ impl QueryEngine {
         engine
     }
 
-    pub fn stopQuery(self: &Arc<Self>, id: usize) {
+    pub fn stop_query(self: &Arc<Self>, id: usize) {
         if let Some(query) = self.queries.lock().unwrap().remove(&id) {
             for source in &query.sources {
                 source.lock().unwrap().stop();
             }
         }
     }
-    pub fn startQuery(self: &Arc<Self>, query: Query) -> usize {
+    pub fn start_query(self: &Arc<Self>, query: Query) -> usize {
         for source in &query.sources {
             source.lock().unwrap().start(self.queue.clone());
         }

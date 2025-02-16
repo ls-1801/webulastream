@@ -18,7 +18,6 @@ pub struct NetworkService {
     sender: NetworkingServiceController,
     runtime: Mutex<Option<Runtime>>,
 }
-
 enum NetworkingServiceControl {
     Stop,
     RegisterChannel(ChannelIdentifier, EmitFn),
@@ -103,7 +102,7 @@ async fn control_socket(mut control: NetworkingServiceControlListener, port: u16
         tokio::select! {
             connect = listener.accept() => {
                 let (stream, addr) = connect?;
-                tokio::spawn(
+                let handle = tokio::spawn(
                     {
                         let channels = registered_channels.clone();
                         async move {
@@ -116,7 +115,7 @@ async fn control_socket(mut control: NetworkingServiceControlListener, port: u16
                let message  = control_message.ok_or("Socket Closed")?;
                match message{
                     NetworkingServiceControl::Stop => return Ok(()),
-                    NetworkingServiceControl::RegisterChannel(ident, emitFn) => registered_channels.write().await.insert(ident, emitFn)
+                    NetworkingServiceControl::RegisterChannel(ident, emit_fn) => registered_channels.write().await.insert(ident, emit_fn)
                 };
             }
         }

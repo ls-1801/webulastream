@@ -1,0 +1,26 @@
+- connection: 8000
+  queries:
+    - type: Source
+      downstream_channel: channel_1
+      downstream_connection: 8001
+    - type: Source
+      downstream_channel: channel_2
+      downstream_connection: 8002
+- connection: 8001
+  queries:
+    - type: Bridge
+      input_channel: channel_1
+      downstream_channel: channel_1
+      downstream_connection: 8003
+- connection: 8002
+  queries:
+    - type: Bridge
+      input_channel: channel_2
+      downstream_channel: channel_2
+      downstream_connection: 8003
+- connection: 8003
+  queries:
+    - type: Sink
+      input_channel: channel_1
+    - type: Sink
+      input_channel: channel_2

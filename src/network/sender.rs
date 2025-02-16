@@ -1,11 +1,11 @@
 use crate::engine::Data;
 use crate::network::protocol::*;
-use crate::network::receiver::EmitFn;
 use crate::network::sender::EstablishChannelResult::{BadConnection, BadProtocol, ChannelReject};
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::str::from_utf8;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +16,7 @@ use tokio::time::error::Elapsed;
 use tracing::{info_span, instrument, Instrument};
 use tracing_subscriber::fmt::format;
 
-type DataQueue = async_channel::Sender<Data>;
+pub(crate) type DataQueue = async_channel::Sender<Data>;
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error>;
 pub(crate) struct NetworkService {
@@ -199,10 +199,9 @@ async fn connection_handler(
     let mut retry = 0;
     'connection: loop {
         let socket = TcpSocket::new_v4()?;
-        let mut connection = match socket
-            .connect(format!("127.0.0.1:{connection}").parse()?)
-            .await
-        {
+        let destination = format!("127.0.0.1:{connection}").parse::<SocketAddr>()?;
+        info!("Connecting to {:?}", destination);
+        let mut connection = match socket.connect(destination).await {
             Ok(connection) => connection,
             Err(e) => {
                 retry += 1;
