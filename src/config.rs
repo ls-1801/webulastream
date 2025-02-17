@@ -17,25 +17,19 @@ pub enum Query {
         input_channel: ChannelIdentifier,
     },
 }
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum Command {
+    StartQuery { q: Query },
+    StopQuery { id: usize },
+    Wait { millis: usize },
+}
 #[derive(Deserialize, Serialize)]
 pub struct Node {
     pub(crate) connection: ConnectionIdentifier,
-    pub queries: Vec<Query>,
+    pub commands: Vec<Command>,
 }
-
-#[test]
-fn test_serialization() {
-    let node = Node {
-        connection: 124,
-        queries: vec![Query::Source {
-            downstream_channel: "yes".to_string(),
-            downstream_connection: 444,
-        }],
-    };
-
-    println!("{}", serde_yaml::to_string(&node).unwrap())
-}
-
 pub(crate) fn load_config(file: &std::path::Path, index: usize) -> Node {
     let file = std::fs::File::open(file).unwrap();
     let mut nodes: Vec<Node> = serde_yaml::from_reader(&file).unwrap();

@@ -2,6 +2,7 @@ mod config;
 mod engine;
 mod network;
 
+use crate::config::Command;
 use crate::engine::{
     Data, EmitFn, ExecutablePipeline, Node, PipelineContext, Query, QueryEngine, SourceImpl,
     SourceNode,
@@ -17,11 +18,13 @@ use std::collections::VecDeque;
 use std::fmt::{Debug, Write};
 use std::str::from_utf8;
 use std::sync;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::{sleep, spawn, Thread};
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{mpsc, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 // mod inter_node {
@@ -46,13 +49,17 @@ impl ExecutablePipeline for PrintSink {
     fn execute(&self, data: Data, _context: &mut dyn PipelineContext) {
         println!("{:?}", from_utf8(&data.bytes));
     }
+
+    fn stop(&self) {
+        //NOP
+    }
 }
 
 struct NetworkSink {
     service: Arc<sender::NetworkService>,
     connection: network::protocol::ConnectionIdentifier,
     channel: network::protocol::ChannelIdentifier,
-    queue: std::sync::RwLock<Option<sender::DataQueue>>,
+    queue: sync::RwLock<Option<(CancellationToken, sender::DataQueue)>>,
     buffer: std::sync::RwLock<VecDeque<Data>>,
 }
 
@@ -77,11 +84,13 @@ impl ExecutablePipeline for NetworkSink {
         if self.queue.read().unwrap().is_none() {
             let mut write_locked = self.queue.write().unwrap();
             if write_locked.is_none() {
+                info!("Network Sink Setup");
                 write_locked.replace(
                     self.service
                         .register_channel(self.connection, self.channel.clone())
                         .unwrap(),
                 );
+                info!("Network Sink Setup Done");
             }
         }
 
@@ -91,7 +100,15 @@ impl ExecutablePipeline for NetworkSink {
                 locked.push_back(data);
                 loop {
                     let front = locked.pop_front().unwrap();
-                    match self.queue.read().unwrap().as_ref().unwrap().try_send(front) {
+                    match self
+                        .queue
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .try_send(front)
+                    {
                         Err(TrySendError::Full(data)) => {
                             locked.push_front(data);
                             return;
@@ -105,7 +122,15 @@ impl ExecutablePipeline for NetworkSink {
             }
         }
 
-        match self.queue.read().unwrap().as_ref().unwrap().try_send(data) {
+        match self
+            .queue
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .try_send(data)
+        {
             Err(TrySendError::Full(data)) => {
                 self.buffer.write().unwrap().push_back(data);
             }
@@ -115,11 +140,17 @@ impl ExecutablePipeline for NetworkSink {
             _ => {}
         }
     }
+
+    fn stop(&self) {
+        info!("Cancelling Sink");
+        self.queue.write().unwrap().take().unwrap().0.cancel();
+    }
 }
 
 struct NetworkSource {
     channel: network::protocol::ChannelIdentifier,
     service: Arc<receiver::NetworkService>,
+    token: std::sync::Mutex<Option<CancellationToken>>,
 }
 
 impl NetworkSource {
@@ -127,38 +158,49 @@ impl NetworkSource {
         channel: network::protocol::ChannelIdentifier,
         service: Arc<receiver::NetworkService>,
     ) -> Self {
-        Self { channel, service }
+        Self {
+            channel,
+            service,
+            token: sync::Mutex::default(),
+        }
     }
 }
 
 impl engine::SourceImpl for NetworkSource {
     fn start(&self, emit: engine::EmitFn) {
-        self.service
-            .register_channel(
-                self.channel.clone(),
-                Box::new(move |data| {
-                    emit(data.bytes);
-                    true
-                }),
-            )
-            .unwrap()
+        self.token.lock().unwrap().replace(
+            self.service
+                .register_channel(
+                    self.channel.clone(),
+                    Box::new(move |data| {
+                        emit(data.bytes);
+                        true
+                    }),
+                )
+                .unwrap(),
+        );
     }
 
-    fn stop(&self) {}
+    fn stop(&self) {
+        info!("Cancelling Source");
+        self.token.lock().unwrap().take().unwrap().cancel();
+    }
 }
 
 struct GeneratorSource {
     thread: sync::RwLock<Option<std::thread::JoinHandle<()>>>,
     interval: Duration,
+    stopped: Arc<AtomicBool>,
 }
 
 impl SourceImpl for GeneratorSource {
     fn start(&self, emit: EmitFn) {
         self.thread.write().unwrap().replace(std::thread::spawn({
             let interval = self.interval;
+            let stopped = self.stopped.clone();
             move || {
                 let mut counter = 0_usize;
-                loop {
+                while !stopped.load(std::sync::atomic::Ordering::Acquire) {
                     let mut buffer = BytesMut::with_capacity(1024);
                     buffer
                         .write_fmt(format_args!(
@@ -169,12 +211,15 @@ impl SourceImpl for GeneratorSource {
                     emit(buffer);
                     sleep(interval);
                 }
+                info!("Generator stopped");
             }
         }));
     }
 
     fn stop(&self) {
-        todo!()
+        self.stopped
+            .as_ref()
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -183,6 +228,7 @@ impl GeneratorSource {
         Self {
             interval,
             thread: sync::RwLock::new(None),
+            stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -202,7 +248,7 @@ fn generator(
                 downstream_channel,
             )),
         ),
-        Box::new(GeneratorSource::new(Duration::from_secs(1))),
+        Box::new(GeneratorSource::new(Duration::from_millis(50))),
     )]));
 
     query
@@ -264,34 +310,42 @@ fn main() {
         .unwrap();
     let receiver = receiver::NetworkService::start(rt, config.connection);
 
-    for query in config.queries.iter() {
-        match query {
-            config::Query::Source {
-                downstream_channel,
-                downstream_connection,
-            } => generator(
-                *downstream_connection,
-                downstream_channel.clone(),
-                sender.clone(),
-                engine.clone(),
-            ),
-            config::Query::Bridge {
-                input_channel,
-                downstream_channel,
-                downstream_connection,
-            } => bridge(
-                input_channel.clone(),
-                downstream_channel.clone(),
-                *downstream_connection,
-                engine.clone(),
-                receiver.clone(),
-                sender.clone(),
-            ),
-            config::Query::Sink { input_channel } => {
-                sink(input_channel.clone(), engine.clone(), receiver.clone())
+    for command in config.commands.iter() {
+        match command {
+            Command::StartQuery { q } => {
+                match q {
+                    config::Query::Source {
+                        downstream_channel,
+                        downstream_connection,
+                    } => generator(
+                        *downstream_connection,
+                        downstream_channel.clone(),
+                        sender.clone(),
+                        engine.clone(),
+                    ),
+                    config::Query::Bridge {
+                        input_channel,
+                        downstream_channel,
+                        downstream_connection,
+                    } => bridge(
+                        input_channel.clone(),
+                        downstream_channel.clone(),
+                        *downstream_connection,
+                        engine.clone(),
+                        receiver.clone(),
+                        sender.clone(),
+                    ),
+                    config::Query::Sink { input_channel } => {
+                        sink(input_channel.clone(), engine.clone(), receiver.clone())
+                    }
+                };
+            }
+            Command::StopQuery { id } => {
+                engine.stop_query(*id);
+            }
+            Command::Wait { millis } => {
+                sleep(Duration::from_millis(*millis as u64));
             }
         };
     }
-    
-    sleep(Duration::from_secs(1000));
 }

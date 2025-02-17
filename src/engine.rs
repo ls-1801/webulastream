@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 use threadpool::ThreadPool;
+use tracing::{error, info};
 
 type ComputeFn = Box<dyn Fn(BytesMut) -> BytesMut + Sync + Send>;
 pub(crate) type EmitFn = Box<dyn Fn(BytesMut) + Sync + Send>;
@@ -15,6 +16,12 @@ struct SimplePipeline {
 pub struct Node {
     pipeline: Arc<dyn ExecutablePipeline + Send + Sync>,
     successor: Option<Arc<Node>>,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.pipeline.stop();
+    }
 }
 
 impl Node {
@@ -68,6 +75,7 @@ pub trait PipelineContext {
 }
 pub trait ExecutablePipeline {
     fn execute(&self, data: Data, context: &mut dyn PipelineContext);
+    fn stop(&self);
 }
 
 enum Task {
@@ -105,7 +113,7 @@ impl Default for QueryEngine {
 }
 
 pub(crate) struct Data {
-    pub(crate) bytes: BytesMut
+    pub(crate) bytes: BytesMut,
 }
 struct PEC<'a> {
     queue: &'a Queue,
@@ -125,7 +133,7 @@ impl QueryEngine {
     pub(crate) fn start() -> Arc<QueryEngine> {
         let engine = Arc::new(QueryEngine::default());
         let pool = ThreadPool::with_name("engine".to_string(), 2);
-        
+
         pool.execute({
             let engine = engine.clone();
             move || loop {
@@ -151,6 +159,9 @@ impl QueryEngine {
             for source in &query.sources {
                 source.lock().unwrap().stop();
             }
+            info!("Stopped Query with Id {id}");
+        } else {
+            error!("Query with id {id} does not exist!");
         }
     }
     pub fn start_query(self: &Arc<Self>, query: Query) -> usize {
@@ -159,6 +170,7 @@ impl QueryEngine {
         }
         let id = self.id_counter.fetch_add(1, Relaxed);
         self.queries.lock().unwrap().insert(id, query);
+        info!("Started Query with id {id}");
         id
     }
 }

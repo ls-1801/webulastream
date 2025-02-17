@@ -1,5 +1,7 @@
 - connection: 8000
   commands:
+    - type: Wait
+      millis: 1000
     - type: StartQuery
       q:
         type: Source
@@ -10,14 +12,20 @@
         type: Source
         downstream_channel: channel_2
         downstream_connection: 8002
+    - type: Wait
+      millis: 10000
 - connection: 8001
   commands:
+    - type: Wait
+      millis: 2000
     - type: StartQuery
       q:
         type: Bridge
         input_channel: channel_1
         downstream_channel: channel_1
         downstream_connection: 8003
+    - type: Wait
+      millis: 10000
 - connection: 8002
   commands:
     - type: StartQuery
@@ -26,8 +34,12 @@
         input_channel: channel_2
         downstream_channel: channel_2
         downstream_connection: 8003
+    - type: Wait
+      millis: 10000
 - connection: 8003
   commands:
+    - type: Wait
+      millis: 4000
     - type: StartQuery
       q:
         type: Sink
@@ -36,3 +48,5 @@
       q:
         type: Sink
         input_channel: channel_2
+    - type: Wait
+      millis: 10000
