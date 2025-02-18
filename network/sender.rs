@@ -1,6 +1,5 @@
-use crate::engine::Data;
-use crate::network::protocol::*;
-use crate::network::sender::EstablishChannelResult::{BadConnection, BadProtocol, ChannelReject};
+use crate::protocol::*;
+use crate::sender::EstablishChannelResult::{BadConnection, BadProtocol, ChannelReject};
 use bytes::BytesMut;
 use log::{info, warn};
 use std::collections::HashMap;
@@ -18,10 +17,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info_span, instrument, Instrument};
 use tracing_subscriber::fmt::format;
 
-pub(crate) type DataQueue = async_channel::Sender<Data>;
+pub type DataQueue = async_channel::Sender<TupleBuffer>;
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error>;
-pub(crate) struct NetworkService {
+pub struct NetworkService {
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
     controller: NetworkingServiceController,
     cancellation_token: CancellationToken,
@@ -42,7 +41,7 @@ enum NetworkingConnectionControlMessage {
     RetryChannel(
         ChannelIdentifier,
         CancellationToken,
-        async_channel::Receiver<Data>,
+        async_channel::Receiver<TupleBuffer>,
     ),
 }
 type NetworkingServiceController = tokio::sync::mpsc::Sender<NetworkingServiceControlMessage>;
@@ -55,7 +54,7 @@ async fn channel_handler(
     cancellation_token: CancellationToken,
     channel: ChannelIdentifier,
     port: u16,
-    queue: async_channel::Receiver<Data>,
+    queue: async_channel::Receiver<TupleBuffer>,
     controller: NetworkingConnectionController,
 ) -> Result<()> {
     let mut retry = 0;
@@ -112,17 +111,11 @@ async fn channel_handler(
             };
 
             match cancellation_token
-                .run_until_cancelled(connection.write_buf(&mut data.bytes))
+                .run_until_cancelled(data.serialize(&mut connection))
                 .await
             {
                 None => {
                     return Ok(());
-                }
-                Some(Ok(0)) => {
-                    warn!("Could not send data to channel: wrote 0 bytes",);
-                    pending_writes = Some(data);
-                    retry += 1;
-                    continue 'connection;
                 }
                 Some(Err(e)) => {
                     warn!("Could not send data to channel: {e}");
@@ -139,8 +132,12 @@ async fn channel_handler(
 
 enum EstablishChannelResult {
     Ok(CancellationToken),
-    ChannelReject(ChannelIdentifier, async_channel::Receiver<Data>),
-    BadConnection(ChannelIdentifier, async_channel::Receiver<Data>, Error),
+    ChannelReject(ChannelIdentifier, async_channel::Receiver<TupleBuffer>),
+    BadConnection(
+        ChannelIdentifier,
+        async_channel::Receiver<TupleBuffer>,
+        Error,
+    ),
     BadProtocol,
 }
 
@@ -148,7 +145,7 @@ async fn establish_channel(
     connection: &mut TcpStream,
     channel: ChannelIdentifier,
     channel_cancellation_token: CancellationToken,
-    queue: async_channel::Receiver<Data>,
+    queue: async_channel::Receiver<TupleBuffer>,
     controller: NetworkingConnectionController,
 ) -> EstablishChannelResult {
     if let Err(e) = connection
@@ -232,7 +229,7 @@ async fn accept_channel_requests(
     Vec<(
         ChannelIdentifier,
         CancellationToken,
-        async_channel::Receiver<Data>,
+        async_channel::Receiver<TupleBuffer>,
     )>,
 > {
     let mut pending = vec![];
@@ -286,7 +283,7 @@ async fn connection_handler(
     let mut pending_channels: Vec<(
         ChannelIdentifier,
         CancellationToken,
-        async_channel::Receiver<Data>,
+        async_channel::Receiver<TupleBuffer>,
     )> = vec![];
     let mut active_channel: HashMap<ChannelIdentifier, CancellationToken> = HashMap::default();
     let on_cancel = |active_channel: HashMap<ChannelIdentifier, CancellationToken>| {
@@ -471,7 +468,7 @@ async fn network_sender_dispatcher(
     }
 }
 impl NetworkService {
-    pub(crate) fn start(runtime: Runtime) -> Arc<NetworkService> {
+    pub fn start(runtime: Runtime) -> Arc<NetworkService> {
         let (controller, listener) = tokio::sync::mpsc::channel(5);
         let cancellation_token = CancellationToken::new();
         runtime.spawn({

@@ -1,5 +1,5 @@
-use crate::network::protocol::{ChannelIdentifier, ConnectionIdentifier};
 use serde::{Deserialize, Serialize};
+use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier};
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type")]

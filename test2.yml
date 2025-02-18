@@ -20,7 +20,7 @@
       millis: 2000
     - type: StartQuery
       q:
-        type: Bridge
+        type: bridge
         input_channel: channel_1
         downstream_channel: channel_1
         downstream_connection: 8003
@@ -30,7 +30,7 @@
   commands:
     - type: StartQuery
       q:
-        type: Bridge
+        type: bridge
         input_channel: channel_2
         downstream_channel: channel_2
         downstream_connection: 8003

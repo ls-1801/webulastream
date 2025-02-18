@@ -1,5 +1,4 @@
-use crate::engine::Data;
-use crate::network::protocol::*;
+use crate::protocol::*;
 use bytes::BytesMut;
 use std::collections::HashMap;
 use std::str::from_utf8;
@@ -32,7 +31,7 @@ type NetworkingServiceController = tokio::sync::mpsc::Sender<NetworkingServiceCo
 type NetworkingServiceControlListener = tokio::sync::mpsc::Receiver<NetworkingServiceControl>;
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error>;
-pub type EmitFn = Box<dyn Fn(Data) -> bool + Send + Sync>;
+pub type EmitFn = Box<dyn Fn(TupleBuffer) -> bool + Send + Sync>;
 
 type RegisteredChannels = Arc<RwLock<HashMap<ChannelIdentifier, (EmitFn, CancellationToken)>>>;
 async fn channel_handler(
@@ -50,26 +49,22 @@ async fn channel_handler(
         return Err("could not accept".into());
     };
 
-    info!("Accepted data channel connection from {address}");
+    info!("Accepted TupleBuffer channel connection from {address}");
     loop {
-        let mut buf = BytesMut::with_capacity(1024);
-        match cancellation_token
-            .run_until_cancelled(stream.read_buf(&mut buf))
+        let buf = match cancellation_token
+            .run_until_cancelled(TupleBuffer::deserialize(&mut stream))
             .await
         {
+            Some(Ok(buf)) => buf,
             None => {
                 return Err("Cancelled".into());
-            }
-            Some(Ok(0)) => {
-                return Err("Connection broken".into());
             }
             Some(Err(e)) => {
                 return Err(e.into());
             }
-            _ => {}
         };
 
-        let response = if (emit(Data { bytes: buf })) {
+        let response = if (emit(buf)) {
             "OK\n".to_string()
         } else {
             "NOT OK\n".to_string()
@@ -108,6 +103,7 @@ async fn create_channel_handler(
             };
             let port = listener.local_addr().unwrap().port();
             tx.send(Ok(port)).unwrap();
+            Span::current().record("port", format!("{}", port));
 
             warn!(
                 "Channel Handler terminated: {:?}",
@@ -127,11 +123,11 @@ async fn create_channel_handler(
                 .await
                 .unwrap();
         }
-        .instrument(info_span!("channel_handler", channel_id = %channel_id))
+        .instrument(info_span!("channel", channel_id = %channel_id))
     });
 
     rx.await?
-        .map_err(|_| "Could not create data channel listener".into())
+        .map_err(|_| "Could not create TupleBuffer channel listener".into())
 }
 async fn control_socket_handler(
     mut stream: TcpStream,

@@ -177,6 +177,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "distributed"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "bytes",
+ "log",
+ "serde",
+ "serde_yaml",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -618,6 +633,7 @@ dependencies = [
  "bytes",
  "clap",
  "crossbeam-queue",
+ "distributed",
  "log",
  "serde",
  "serde_yaml",

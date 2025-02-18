@@ -1,17 +1,16 @@
 mod config;
 mod engine;
-mod network;
 
 use crate::config::Command;
 use crate::engine::{
     Data, EmitFn, ExecutablePipeline, Node, PipelineContext, Query, QueryEngine, SourceImpl,
     SourceNode,
 };
-use crate::network::protocol::{ChannelIdentifier, ConnectionIdentifier};
-use crate::network::{receiver, sender};
 use async_channel::TrySendError;
 use bytes::{Bytes, BytesMut};
 use clap::{Parser, Subcommand};
+use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
+use distributed::{receiver, sender};
 use log::warn;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::VecDeque;
@@ -57,17 +56,17 @@ impl ExecutablePipeline for PrintSink {
 
 struct NetworkSink {
     service: Arc<sender::NetworkService>,
-    connection: network::protocol::ConnectionIdentifier,
-    channel: network::protocol::ChannelIdentifier,
+    connection: ConnectionIdentifier,
+    channel: ChannelIdentifier,
     queue: sync::RwLock<Option<(CancellationToken, sender::DataQueue)>>,
-    buffer: std::sync::RwLock<VecDeque<Data>>,
+    buffer: std::sync::RwLock<VecDeque<TupleBuffer>>,
 }
 
 impl NetworkSink {
     pub fn new(
         service: Arc<sender::NetworkService>,
-        connection: network::protocol::ConnectionIdentifier,
-        channel: network::protocol::ChannelIdentifier,
+        connection: ConnectionIdentifier,
+        channel: ChannelIdentifier,
     ) -> Self {
         Self {
             service,
@@ -81,6 +80,10 @@ impl NetworkSink {
 
 impl ExecutablePipeline for NetworkSink {
     fn execute(&self, data: Data, _context: &mut dyn PipelineContext) {
+        let data = TupleBuffer {
+            sequence_number: 1,
+            data: data.bytes.freeze(),
+        };
         if self.queue.read().unwrap().is_none() {
             let mut write_locked = self.queue.write().unwrap();
             if write_locked.is_none() {
@@ -148,16 +151,13 @@ impl ExecutablePipeline for NetworkSink {
 }
 
 struct NetworkSource {
-    channel: network::protocol::ChannelIdentifier,
+    channel: ChannelIdentifier,
     service: Arc<receiver::NetworkService>,
     token: std::sync::Mutex<Option<CancellationToken>>,
 }
 
 impl NetworkSource {
-    pub fn new(
-        channel: network::protocol::ChannelIdentifier,
-        service: Arc<receiver::NetworkService>,
-    ) -> Self {
+    pub fn new(channel: ChannelIdentifier, service: Arc<receiver::NetworkService>) -> Self {
         Self {
             channel,
             service,
@@ -173,7 +173,7 @@ impl engine::SourceImpl for NetworkSource {
                 .register_channel(
                     self.channel.clone(),
                     Box::new(move |data| {
-                        emit(data.bytes);
+                        emit(data.data.try_into_mut().unwrap());
                         true
                     }),
                 )
