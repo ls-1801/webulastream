@@ -30,13 +30,13 @@ enum NetworkingServiceControl {
 type NetworkingServiceController = tokio::sync::mpsc::Sender<NetworkingServiceControl>;
 type NetworkingServiceControlListener = tokio::sync::mpsc::Receiver<NetworkingServiceControl>;
 pub type Result<T> = std::result::Result<T, Error>;
-pub type Error = Box<dyn std::error::Error>;
-pub type EmitFn = Box<dyn Fn(TupleBuffer) -> bool + Send + Sync>;
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type EmitFn = Box<dyn FnMut(TupleBuffer) -> bool + Send + Sync>;
 
 type RegisteredChannels = Arc<RwLock<HashMap<ChannelIdentifier, (EmitFn, CancellationToken)>>>;
 async fn channel_handler(
     cancellation_token: CancellationToken,
-    emit: &EmitFn,
+    emit: &mut EmitFn,
     listener: &mut TcpListener,
 ) -> Result<()> {
     let Some(Ok(Ok((mut stream, address)))) = cancellation_token
@@ -63,11 +63,11 @@ async fn channel_handler(
                 return Err(e.into());
             }
         };
-
+        let sequence = buf.sequence_number;
         let response = if (emit(buf)) {
-            "OK\n".to_string()
+            format!("OK {}\n", sequence)
         } else {
-            "NOT OK\n".to_string()
+            format!("NOT OK {}\n", sequence)
         };
 
         match cancellation_token
@@ -86,7 +86,7 @@ async fn channel_handler(
 }
 async fn create_channel_handler(
     channel_id: ChannelIdentifier,
-    emit: EmitFn,
+    mut emit: EmitFn,
     channel_cancellation_token: CancellationToken,
     control: NetworkingServiceController,
 ) -> Result<u16> {
@@ -107,7 +107,7 @@ async fn create_channel_handler(
 
             warn!(
                 "Channel Handler terminated: {:?}",
-                channel_handler(channel_cancellation_token.clone(), &emit, &mut listener).await
+                channel_handler(channel_cancellation_token.clone(), &mut emit, &mut listener).await
             );
             if channel_cancellation_token.is_cancelled() {
                 return;

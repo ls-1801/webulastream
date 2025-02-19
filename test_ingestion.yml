@@ -1,0 +1,18 @@
+- connection: 8000
+  commands:
+    - type: StartQuery
+      q:
+        type: Source
+        downstream_channel: channel_1
+        downstream_connection: 8001
+    - type: Wait
+      millis: 50000
+- connection: 8001
+  commands:
+    - type: StartQuery
+      q:
+        type: Sink
+        input_channel: channel_1
+        ingestion_rate_in_milliseconds: 1000
+    - type: Wait
+      millis: 50000

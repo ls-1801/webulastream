@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier};
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -12,9 +12,11 @@ pub enum Query {
         input_channel: ChannelIdentifier,
         downstream_channel: ChannelIdentifier,
         downstream_connection: ConnectionIdentifier,
+        ingestion_rate_in_milliseconds: Option<u64>,
     },
     Sink {
         input_channel: ChannelIdentifier,
+        ingestion_rate_in_milliseconds: Option<u64>,
     },
 }
 

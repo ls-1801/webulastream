@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
+use distributed::protocol::TupleBuffer;
 use threadpool::ThreadPool;
 use tracing::{error, info};
 
-type ComputeFn = Box<dyn Fn(BytesMut) -> BytesMut + Sync + Send>;
-pub(crate) type EmitFn = Box<dyn Fn(BytesMut) + Sync + Send>;
+type ComputeFn = Box<dyn Fn(TupleBuffer) -> TupleBuffer + Sync + Send>;
+pub(crate) type EmitFn = Box<dyn Fn(TupleBuffer) + Sync + Send>;
 type Queue = crossbeam_queue::ArrayQueue<Task>;
 struct SimplePipeline {
     pub fun: ComputeFn,
@@ -71,15 +72,15 @@ pub trait SourceImpl {
     fn stop(&self);
 }
 pub trait PipelineContext {
-    fn emit(&mut self, data: Data);
+    fn emit(&mut self, data: TupleBuffer);
 }
 pub trait ExecutablePipeline {
-    fn execute(&self, data: Data, context: &mut dyn PipelineContext);
+    fn execute(&self, data: &TupleBuffer, context: &mut dyn PipelineContext);
     fn stop(&self);
 }
 
 enum Task {
-    Compute(BytesMut, Arc<Node>),
+    Compute(TupleBuffer, Arc<Node>),
 }
 
 pub struct Query {
@@ -112,19 +113,16 @@ impl Default for QueryEngine {
     }
 }
 
-pub(crate) struct Data {
-    pub(crate) bytes: BytesMut,
-}
 struct PEC<'a> {
     queue: &'a Queue,
     successor: &'a Option<Arc<Node>>,
 }
 
 impl PipelineContext for PEC<'_> {
-    fn emit(&mut self, data: Data) {
+    fn emit(&mut self, data: TupleBuffer) {
         if let Some(successor) = self.successor {
             self.queue
-                .push(Task::Compute(data.bytes, successor.clone()));
+                .push(Task::Compute(data, successor.clone()));
         }
     }
 }
@@ -144,7 +142,7 @@ impl QueryEngine {
                                 queue: &engine.queue,
                                 successor: &node.successor,
                             };
-                            node.pipeline.execute(Data { bytes: input }, &mut pec);
+                            node.pipeline.execute(&input, &mut pec);
                         }
                     }
                 }

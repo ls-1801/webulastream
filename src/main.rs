@@ -3,8 +3,7 @@ mod engine;
 
 use crate::config::Command;
 use crate::engine::{
-    Data, EmitFn, ExecutablePipeline, Node, PipelineContext, Query, QueryEngine, SourceImpl,
-    SourceNode,
+    EmitFn, ExecutablePipeline, Node, PipelineContext, Query, QueryEngine, SourceImpl, SourceNode,
 };
 use async_channel::TrySendError;
 use bytes::{Bytes, BytesMut};
@@ -12,19 +11,16 @@ use clap::{Parser, Subcommand};
 use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
 use distributed::{receiver, sender};
 use log::warn;
-use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::VecDeque;
-use std::fmt::{Debug, Write};
-use std::str::from_utf8;
+use std::fmt::Write;
+use std::ops::Add;
 use std::sync;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::thread::{sleep, spawn, Thread};
-use std::time::Duration;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::{mpsc, RwLock};
+use std::sync::{Arc, RwLock};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::info;
 
 // mod inter_node {
 pub type Result<T> = std::result::Result<T, Error>;
@@ -45,8 +41,8 @@ enum Commands {}
 struct PrintSink {}
 
 impl ExecutablePipeline for PrintSink {
-    fn execute(&self, data: Data, _context: &mut dyn PipelineContext) {
-        println!("{:?}", from_utf8(&data.bytes));
+    fn execute(&self, data: &TupleBuffer, _context: &mut dyn PipelineContext) {
+        println!("{:?}", data);
     }
 
     fn stop(&self) {
@@ -79,11 +75,7 @@ impl NetworkSink {
 }
 
 impl ExecutablePipeline for NetworkSink {
-    fn execute(&self, data: Data, _context: &mut dyn PipelineContext) {
-        let data = TupleBuffer {
-            sequence_number: 1,
-            data: data.bytes.freeze(),
-        };
+    fn execute(&self, data: &TupleBuffer, _context: &mut dyn PipelineContext) {
         if self.queue.read().unwrap().is_none() {
             let mut write_locked = self.queue.write().unwrap();
             if write_locked.is_none() {
@@ -100,7 +92,7 @@ impl ExecutablePipeline for NetworkSink {
         if !self.buffer.read().unwrap().is_empty() {
             let mut locked = self.buffer.write().unwrap();
             if !locked.is_empty() {
-                locked.push_back(data);
+                locked.push_back(data.clone());
                 loop {
                     let front = locked.pop_front().unwrap();
                     match self
@@ -132,7 +124,7 @@ impl ExecutablePipeline for NetworkSink {
             .as_ref()
             .unwrap()
             .1
-            .try_send(data)
+            .try_send(data.clone())
         {
             Err(TrySendError::Full(data)) => {
                 self.buffer.write().unwrap().push_back(data);
@@ -153,14 +145,20 @@ impl ExecutablePipeline for NetworkSink {
 struct NetworkSource {
     channel: ChannelIdentifier,
     service: Arc<receiver::NetworkService>,
+    ingestion_rate: Option<Duration>,
     token: std::sync::Mutex<Option<CancellationToken>>,
 }
 
 impl NetworkSource {
-    pub fn new(channel: ChannelIdentifier, service: Arc<receiver::NetworkService>) -> Self {
+    pub fn new(
+        channel: ChannelIdentifier,
+        ingestion_rate: Option<Duration>,
+        service: Arc<receiver::NetworkService>,
+    ) -> Self {
         Self {
             channel,
             service,
+            ingestion_rate,
             token: sync::Mutex::default(),
         }
     }
@@ -168,13 +166,28 @@ impl NetworkSource {
 
 impl engine::SourceImpl for NetworkSource {
     fn start(&self, emit: engine::EmitFn) {
+        let mut last_successful_ingestion = Arc::new(RwLock::new(SystemTime::now()));
+        let ingestion_rate = self.ingestion_rate.unwrap_or(Duration::from_millis(0));
         self.token.lock().unwrap().replace(
             self.service
                 .register_channel(
                     self.channel.clone(),
-                    Box::new(move |data| {
-                        emit(data.data.try_into_mut().unwrap());
-                        true
+                    Box::new({
+                        let last_successful_ingestion = last_successful_ingestion.clone();
+                        move |data| {
+                            let now = SystemTime::now();
+                            if last_successful_ingestion
+                                .read()
+                                .unwrap()
+                                .add(ingestion_rate)
+                                < now
+                            {
+                                emit(data);
+                                *last_successful_ingestion.write().unwrap() = now;
+                                return true;
+                            }
+                            false
+                        }
                     }),
                 )
                 .unwrap(),
@@ -208,7 +221,15 @@ impl SourceImpl for GeneratorSource {
                         ))
                         .unwrap();
                     counter += 1;
-                    emit(buffer);
+                    emit(TupleBuffer {
+                        sequence_number: counter as u64,
+                        origin_id: 1,
+                        chunk_number: 1,
+                        number_of_tuples: 1,
+                        last_chunk: true,
+                        data: buffer.freeze(),
+                        child_buffers: vec![],
+                    });
                     sleep(interval);
                 }
                 info!("Generator stopped");
@@ -256,12 +277,17 @@ fn generator(
 
 fn sink(
     channel: ChannelIdentifier,
+    ingestion_rate_in_milliseconds: Option<u64>,
     engine: Arc<QueryEngine>,
     receiver: Arc<receiver::NetworkService>,
 ) -> usize {
     engine.start_query(Query::new(vec![SourceNode::new(
         Node::new(None, Arc::new(PrintSink {})),
-        Box::new(NetworkSource::new(channel, receiver.clone())),
+        Box::new(NetworkSource::new(
+            channel,
+            ingestion_rate_in_milliseconds.map(|millis| Duration::from_millis(millis)),
+            receiver.clone(),
+        )),
     )]))
 }
 
@@ -269,6 +295,7 @@ fn bridge(
     input_channel: ChannelIdentifier,
     downstream_channel: ChannelIdentifier,
     downstream_connection: ConnectionIdentifier,
+    ingestion_rate_in_milliseconds: Option<u64>,
     engine: Arc<QueryEngine>,
     receiver: Arc<receiver::NetworkService>,
     sender: Arc<sender::NetworkService>,
@@ -282,7 +309,11 @@ fn bridge(
                 downstream_channel,
             )),
         ),
-        Box::new(NetworkSource::new(input_channel, receiver.clone())),
+        Box::new(NetworkSource::new(
+            input_channel,
+            ingestion_rate_in_milliseconds.map(|millis| Duration::from_millis(millis)),
+            receiver.clone(),
+        )),
     )]));
     query
 }
@@ -327,17 +358,25 @@ fn main() {
                         input_channel,
                         downstream_channel,
                         downstream_connection,
+                        ingestion_rate_in_milliseconds,
                     } => bridge(
                         input_channel.clone(),
                         downstream_channel.clone(),
                         *downstream_connection,
+                        ingestion_rate_in_milliseconds.clone(),
                         engine.clone(),
                         receiver.clone(),
                         sender.clone(),
                     ),
-                    config::Query::Sink { input_channel } => {
-                        sink(input_channel.clone(), engine.clone(), receiver.clone())
-                    }
+                    config::Query::Sink {
+                        input_channel,
+                        ingestion_rate_in_milliseconds,
+                    } => sink(
+                        input_channel.clone(),
+                        ingestion_rate_in_milliseconds.clone(),
+                        engine.clone(),
+                        receiver.clone(),
+                    ),
                 };
             }
             Command::StopQuery { id } => {
