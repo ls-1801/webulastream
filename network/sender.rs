@@ -2,7 +2,7 @@ use crate::protocol::*;
 use crate::sender::ChannelHandlerResult::ConnectionLost;
 use crate::sender::EstablishChannelResult::{BadConnection, BadProtocol, ChannelReject};
 use async_channel::RecvError;
-use bytes::BytesMut;
+use bytes::{Buf, Bytes, BytesMut};
 use log::{info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
@@ -18,7 +18,7 @@ use tokio::sync::mpsc::error::{SendError, TryRecvError};
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info_span, instrument, Instrument};
+use tracing::{error, info_span, instrument, trace, Instrument};
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::format;
 
@@ -66,38 +66,56 @@ enum DataResponse {
     Ok(u64),
     NotOk(u64),
 }
-async fn read_response(mut reader: &mut TcpStream) -> Result<Vec<DataResponse>> {
+
+fn try_read_response(
+    mut reader: &mut TcpStream,
+    buffer: &mut BytesMut,
+) -> Result<Vec<DataResponse>> {
     let mut responses = vec![];
-    let mut buffer = [0u8; 256];
     loop {
-        let n = match reader.try_read(&mut buffer[..]) {
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e.into()),
+        let n = match reader.try_read_buf(buffer) {
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                break;
+            }
+            Err(e) => {
+                error!("Error while waiting for response: {e:?}");
+                return Err(e.into());
+            }
             Ok(0) => return Err("Connection closed".into()),
             Ok(n) => n,
         };
 
         let txt_responses =
-            from_utf8(&buffer[0..n]).map_err(|e| "Protocol Error expected utf8 response")?;
-        for response in txt_responses.split('\n') {
-            if response.starts_with("OK ") {
-                let seq = response
-                    .strip_prefix("OK ")
-                    .unwrap()
-                    .parse::<u64>()
-                    .map_err(|e| "Protocol Error expected sequence number in response")?;
-                responses.push(DataResponse::Ok(seq));
-            } else if response.starts_with("NOT OK ") {
-                let seq = response
-                    .strip_prefix("NOT OK ")
-                    .unwrap()
-                    .parse::<u64>()
-                    .map_err(|e| "Protocol Error expected sequence number in response")?;
-                responses.push(DataResponse::NotOk(seq));
-            } else {
-                return Err("Protocol Error expected \"OK <seq>\"/ \"NOT OK <seq>\"".into());
+            from_utf8(&buffer[..]).map_err(|e| "Protocol Error expected utf8 response")?;
+        let mut index = 0;
+        {
+            let txt_responses = txt_responses.split('\n').collect::<Vec<_>>();
+            for response in txt_responses.into_iter().rev().skip(1).rev() {
+                index += response.len() + 1;
+                if response.starts_with("OK ") {
+                    let seq = response
+                        .strip_prefix("OK ")
+                        .unwrap()
+                        .parse::<u64>()
+                        .map_err(|e| "Protocol Error expected sequence number in response")?;
+                    responses.push(DataResponse::Ok(seq));
+                } else if response.starts_with("NOT OK ") {
+                    let seq = response
+                        .strip_prefix("NOT OK ")
+                        .unwrap()
+                        .parse::<u64>()
+                        .map_err(|e| "Protocol Error expected sequence number in response")?;
+                    responses.push(DataResponse::NotOk(seq));
+                } else {
+                    return Err("Protocol Error expected \"OK <seq>\"/ \"NOT OK <seq>\"".into());
+                }
             }
         }
+
+        let (beginning, end) = buffer[..].split_at_mut(index);
+        let length = end.len();
+        beginning[0..length].copy_from_slice(end);
+        buffer.resize(length, 0);
     }
     Ok(responses)
 }
@@ -123,19 +141,14 @@ async fn channel_handler(
         Some(Ok(connection)) => connection,
     };
 
+    let mut response_buffer = BytesMut::with_capacity(256);
+    let mut pending_writes: Vec<TupleBuffer> = vec![];
     loop {
-        let responses = match cancellation_token
-            .run_until_cancelled(read_response(&mut connection))
-            .await
-        {
-            None => {
-                return ChannelHandlerResult::Cancelled;
-            }
-            Some(Ok(res)) => res,
-            Some(Err(e)) => return ChannelHandlerResult::ConnectionLost(e.into()),
+        let responses = match try_read_response(&mut connection, &mut response_buffer) {
+            Ok(res) => res,
+            Err(e) => return ChannelHandlerResult::ConnectionLost(e.into()),
         };
 
-        let mut pending_writes: Vec<TupleBuffer> = vec![];
         for response in responses {
             match response {
                 DataResponse::Ok(seq) => {
@@ -143,7 +156,6 @@ async fn channel_handler(
                     wait_for_ack.remove(&seq);
                 }
                 DataResponse::NotOk(seq) => {
-                    info!("NAck for {seq}");
                     let Some(write) = wait_for_ack.remove(&seq) else {
                         return ChannelHandlerResult::ConnectionLost(
                             "Protocol Error: Receiver acknowledged a sequence that does not exist"
@@ -154,7 +166,6 @@ async fn channel_handler(
                 }
             }
         }
-
         for pending_write in pending_writes {
             match cancellation_token
                 .run_until_cancelled(pending_write.serialize(&mut connection))
@@ -171,31 +182,20 @@ async fn channel_handler(
                 }
             }
         }
+        pending_writes = vec![];
 
         while wait_for_ack.len() < window_size {
             match queue.try_recv() {
                 Err(async_channel::TryRecvError::Empty) => break,
                 Ok(data) => {
-                    match cancellation_token
-                        .run_until_cancelled(data.serialize(&mut connection))
-                        .await
-                    {
-                        None => {
-                            return ChannelHandlerResult::Cancelled;
-                        }
-                        Some(Ok(())) => {
-                            wait_for_ack.insert(data.sequence_number, data);
-                        }
-                        Some(Err(e)) => {
-                            return ChannelHandlerResult::ConnectionLost(e.into());
-                        }
-                    }
+                    pending_writes.push(data);
                 }
                 Err(async_channel::TryRecvError::Closed) => {
                     panic!("Data Channel Queue should not be closed");
                 }
             }
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

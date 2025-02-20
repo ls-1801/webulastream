@@ -93,7 +93,7 @@ impl ExecutablePipeline for NetworkSink {
             let mut locked = self.buffer.write().unwrap();
             if !locked.is_empty() {
                 locked.push_back(data.clone());
-                loop {
+                while !locked.is_empty() {
                     let front = locked.pop_front().unwrap();
                     match self
                         .queue
@@ -269,7 +269,7 @@ fn generator(
                 downstream_channel,
             )),
         ),
-        Box::new(GeneratorSource::new(Duration::from_millis(50))),
+        Box::new(GeneratorSource::new(Duration::from_millis(250))),
     )]));
 
     query

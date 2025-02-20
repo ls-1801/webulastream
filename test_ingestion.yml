@@ -13,6 +13,6 @@
       q:
         type: Sink
         input_channel: channel_1
-        ingestion_rate_in_milliseconds: 1000
+        ingestion_rate_in_milliseconds: 300
     - type: Wait
       millis: 50000
