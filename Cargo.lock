@@ -182,7 +182,6 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "bytes",
- "log",
  "serde",
  "serde_yaml",
  "tokio",

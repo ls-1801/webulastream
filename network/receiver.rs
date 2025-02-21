@@ -219,10 +219,8 @@ impl NetworkService {
             let controller = tx;
             async move {
                 info!("Starting Control");
-                info!(
-                    "Control stopped: {:?}",
-                    control_socket(listener, controller, port).await
-                )
+                let control_socket_result = control_socket(listener, controller, port).await;
+                info!("Control stopped: {:?}", control_socket_result)
             }
         });
 

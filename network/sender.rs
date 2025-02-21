@@ -3,7 +3,6 @@ use crate::sender::ChannelHandlerResult::ConnectionLost;
 use crate::sender::EstablishChannelResult::{BadConnection, BadProtocol, ChannelReject};
 use async_channel::RecvError;
 use bytes::{Buf, Bytes, BytesMut};
-use log::{info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
@@ -18,7 +17,7 @@ use tokio::sync::mpsc::error::{SendError, TryRecvError};
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info_span, instrument, trace, Instrument};
+use tracing::{error, info, info_span, instrument, trace, warn, Instrument};
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::format;
 
@@ -175,6 +174,7 @@ async fn channel_handler(
                     return ChannelHandlerResult::Cancelled;
                 }
                 Some(Ok(())) => {
+                    info!("Data was sent!");
                     wait_for_ack.insert(pending_write.sequence_number, pending_write);
                 }
                 Some(Err(e)) => {
@@ -191,7 +191,7 @@ async fn channel_handler(
                     pending_writes.push(data);
                 }
                 Err(async_channel::TryRecvError::Closed) => {
-                    panic!("Data Channel Queue should not be closed");
+                    return ChannelHandlerResult::Closed;
                 }
             }
         }
