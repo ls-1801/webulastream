@@ -7,6 +7,7 @@ pub enum Query {
     Source {
         downstream_channel: ChannelIdentifier,
         downstream_connection: ConnectionIdentifier,
+        ingestion_rate_in_milliseconds: Option<u64>,
     },
     Bridge {
         input_channel: ChannelIdentifier,

@@ -5,20 +5,19 @@ use crate::config::Command;
 use crate::engine::{
     EmitFn, ExecutablePipeline, Node, PipelineContext, Query, QueryEngine, SourceImpl, SourceNode,
 };
-use async_channel::TrySendError;
-use bytes::{Bytes, BytesMut};
+use async_channel::{RecvError, TryRecvError, TrySendError};
+use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
 use distributed::{receiver, sender};
-use log::warn;
+use log::{error};
 use std::collections::VecDeque;
-use std::fmt::Write;
-use std::ops::Add;
-use std::sync;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
+use std::sync::{Arc};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
+use std::{sync, thread};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -38,11 +37,67 @@ struct CLIArgs {
 #[derive(Subcommand)]
 enum Commands {}
 
-struct PrintSink {}
+struct PrintSink;
+
+fn verify_tuple_buffer(received: &TupleBuffer) -> bool {
+    let counter = (received.sequence_number - 1) as usize;
+
+    // Reconstruct main buffer
+    let mut expected_buffer = BytesMut::with_capacity(8192);
+    let value_bytes = counter.to_le_bytes();
+
+    while expected_buffer.len() + size_of::<usize>() <= expected_buffer.capacity() {
+        expected_buffer.put(&value_bytes[..]);
+    }
+
+    // Verify main buffer
+    if received.data != expected_buffer.freeze() {
+        return false;
+    }
+
+    // Reconstruct child buffers
+    let mut expected_child_buffers = vec![];
+    for idx in 0..(counter % 3) {
+        let capacity = ((idx + 1) * (10 * counter)) % 8192;
+        let mut buffer = BytesMut::with_capacity(capacity);
+        let value_bytes = counter.to_le_bytes();
+
+        while buffer.len() + size_of::<usize>() <= buffer.capacity() {
+            buffer.put(&value_bytes[..]);
+        }
+
+        expected_child_buffers.push(buffer.freeze());
+    }
+
+    // Verify child buffers
+    if received.child_buffers.len() != expected_child_buffers.len() {
+        return false;
+    }
+
+    for (received_child, expected_child) in received
+        .child_buffers
+        .iter()
+        .zip(expected_child_buffers.iter())
+    {
+        if received_child != expected_child {
+            return false;
+        }
+    }
+
+    true
+}
 
 impl ExecutablePipeline for PrintSink {
     fn execute(&self, data: &TupleBuffer, _context: &mut dyn PipelineContext) {
-        println!("{:?}", data);
+        info!(
+            "Buffer {} is {}",
+            data.sequence_number,
+            if verify_tuple_buffer(data) {
+                "OK"
+            } else {
+                "NOT OK"
+            }
+        );
     }
 
     fn stop(&self) {
@@ -147,6 +202,7 @@ struct NetworkSource {
     service: Arc<receiver::NetworkService>,
     ingestion_rate: Option<Duration>,
     token: std::sync::Mutex<Option<CancellationToken>>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl NetworkSource {
@@ -160,38 +216,32 @@ impl NetworkSource {
             service,
             ingestion_rate,
             token: sync::Mutex::default(),
+            thread: sync::Mutex::default(),
         }
     }
 }
 
 impl engine::SourceImpl for NetworkSource {
     fn start(&self, emit: engine::EmitFn) {
-        let mut last_successful_ingestion = Arc::new(RwLock::new(SystemTime::now()));
         let ingestion_rate = self.ingestion_rate.unwrap_or(Duration::from_millis(0));
-        self.token.lock().unwrap().replace(
-            self.service
-                .register_channel(
-                    self.channel.clone(),
-                    Box::new({
-                        let last_successful_ingestion = last_successful_ingestion.clone();
-                        move |data| {
-                            let now = SystemTime::now();
-                            if last_successful_ingestion
-                                .read()
-                                .unwrap()
-                                .add(ingestion_rate)
-                                < now
-                            {
-                                emit(data);
-                                *last_successful_ingestion.write().unwrap() = now;
-                                return true;
-                            }
-                            false
-                        }
-                    }),
-                )
-                .unwrap(),
-        );
+        let (queue, token) = self.service.register_channel(self.channel.clone()).unwrap();
+        self.token.lock().unwrap().replace(token);
+
+        self.thread
+            .lock()
+            .unwrap()
+            .replace(thread::spawn(move || loop {
+                match queue.recv_blocking() {
+                    Ok(d) => {
+                        emit(d);
+                    }
+                    Err(e) => {
+                        error!("Source stopped {e}");
+                        return;
+                    }
+                };
+                sleep(ingestion_rate);
+            }));
     }
 
     fn stop(&self) {
@@ -200,26 +250,79 @@ impl engine::SourceImpl for NetworkSource {
     }
 }
 
-struct GeneratorSource {
-    thread: sync::RwLock<Option<std::thread::JoinHandle<()>>>,
-    interval: Duration,
+struct Thread<T> {
     stopped: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<T>>,
+}
+
+impl<T> Drop for Thread<T> {
+    fn drop(&mut self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        if !self
+            .handle
+            .as_ref()
+            .expect("BUG: Dropped multiple times")
+            .is_finished()
+        {
+            self.handle
+                .take()
+                .expect("BUG: Dropped multiple times")
+                .join()
+                .unwrap();
+        }
+    }
+}
+
+impl<T> Thread<T> {
+    pub fn spawn<F>(function: F) -> Self
+    where
+        F: 'static + Send + FnOnce(&AtomicBool) -> T,
+        T: 'static + Send,
+    {
+        let stopped: Arc<AtomicBool> = Arc::default();
+        let handle = thread::spawn({
+            let token = stopped.clone();
+            move || function(token.as_ref())
+        });
+
+        Thread {
+            stopped,
+            handle: Some(handle),
+        }
+    }
+}
+
+struct GeneratorSource {
+    thread: sync::RwLock<Option<Thread<()>>>,
+    interval: Duration,
 }
 
 impl SourceImpl for GeneratorSource {
     fn start(&self, emit: EmitFn) {
-        self.thread.write().unwrap().replace(std::thread::spawn({
+        self.thread.write().unwrap().replace(Thread::spawn({
             let interval = self.interval;
-            let stopped = self.stopped.clone();
-            move || {
+            move |stopped| {
                 let mut counter = 0_usize;
-                while !stopped.load(std::sync::atomic::Ordering::Acquire) {
-                    let mut buffer = BytesMut::with_capacity(1024);
-                    buffer
-                        .write_fmt(format_args!(
-                            "This is a generated buffer with id{counter}\n"
-                        ))
-                        .unwrap();
+                while !stopped.load(Acquire) {
+                    let mut buffer = BytesMut::with_capacity(8192);
+                    let value_bytes = counter.to_le_bytes(); // Use `to_be_bytes()` for big-endian
+                    while buffer.len() + size_of::<usize>() <= buffer.capacity() {
+                        buffer.put(&value_bytes[..]);
+                    }
+                    let buffer = buffer.freeze();
+
+                    let mut child_buffers = vec![];
+                    for idx in 0..(counter % 3) {
+                        let mut buffer =
+                            BytesMut::with_capacity(((idx + 1) * (10 * counter)) % 8192);
+                        let value_bytes = counter.to_le_bytes(); // Use `to_be_bytes()` for big-endian
+                        while buffer.len() + size_of::<usize>() <= buffer.capacity() {
+                            buffer.put(&value_bytes[..]);
+                        }
+                        child_buffers.push(buffer.freeze());
+                    }
+
                     counter += 1;
                     emit(TupleBuffer {
                         sequence_number: counter as u64,
@@ -227,8 +330,8 @@ impl SourceImpl for GeneratorSource {
                         chunk_number: 1,
                         number_of_tuples: 1,
                         last_chunk: true,
-                        data: buffer.freeze(),
-                        child_buffers: vec![],
+                        data: buffer,
+                        child_buffers,
                     });
                     sleep(interval);
                 }
@@ -238,9 +341,7 @@ impl SourceImpl for GeneratorSource {
     }
 
     fn stop(&self) {
-        self.stopped
-            .as_ref()
-            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.thread.write().unwrap().take();
     }
 }
 
@@ -249,7 +350,6 @@ impl GeneratorSource {
         Self {
             interval,
             thread: sync::RwLock::new(None),
-            stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -257,6 +357,7 @@ impl GeneratorSource {
 fn generator(
     downstream_connection: ConnectionIdentifier,
     downstream_channel: ChannelIdentifier,
+    ingestion_rate_in_milliseconds: Option<u64>,
     sender: Arc<sender::NetworkService>,
     engine: Arc<QueryEngine>,
 ) -> usize {
@@ -269,7 +370,9 @@ fn generator(
                 downstream_channel,
             )),
         ),
-        Box::new(GeneratorSource::new(Duration::from_millis(250))),
+        Box::new(GeneratorSource::new(Duration::from_millis(
+            ingestion_rate_in_milliseconds.unwrap_or(250),
+        ))),
     )]));
 
     query
@@ -341,16 +444,18 @@ fn main() {
         .unwrap();
     let receiver = receiver::NetworkService::start(rt, config.connection);
 
-    for command in config.commands.iter() {
+    for command in config.commands.into_iter() {
         match command {
             Command::StartQuery { q } => {
                 match q {
                     config::Query::Source {
                         downstream_channel,
                         downstream_connection,
+                        ingestion_rate_in_milliseconds,
                     } => generator(
-                        *downstream_connection,
-                        downstream_channel.clone(),
+                        downstream_connection,
+                        downstream_channel,
+                        ingestion_rate_in_milliseconds,
                         sender.clone(),
                         engine.clone(),
                     ),
@@ -360,10 +465,10 @@ fn main() {
                         downstream_connection,
                         ingestion_rate_in_milliseconds,
                     } => bridge(
-                        input_channel.clone(),
-                        downstream_channel.clone(),
-                        *downstream_connection,
-                        ingestion_rate_in_milliseconds.clone(),
+                        input_channel,
+                        downstream_channel,
+                        downstream_connection,
+                        ingestion_rate_in_milliseconds,
                         engine.clone(),
                         receiver.clone(),
                         sender.clone(),
@@ -372,18 +477,18 @@ fn main() {
                         input_channel,
                         ingestion_rate_in_milliseconds,
                     } => sink(
-                        input_channel.clone(),
-                        ingestion_rate_in_milliseconds.clone(),
+                        input_channel,
+                        ingestion_rate_in_milliseconds,
                         engine.clone(),
                         receiver.clone(),
                     ),
                 };
             }
             Command::StopQuery { id } => {
-                engine.stop_query(*id);
+                engine.stop_query(id);
             }
             Command::Wait { millis } => {
-                sleep(Duration::from_millis(*millis as u64));
+                sleep(Duration::from_millis(millis as u64));
             }
         };
     }

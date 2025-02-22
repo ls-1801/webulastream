@@ -1,22 +1,14 @@
-use crate::ffi::{emit, SerializedTupleBuffer};
-use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
-use distributed::sender::DataQueue;
+use crate::ffi::SerializedTupleBuffer;
+use distributed::protocol::{ChannelIdentifier, TupleBuffer};
 use distributed::*;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::error::Error;
-use std::str::from_utf8;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-
-use std::io;
-
-use tracing::{subscriber::fmt, Level};
-use tracing_subscriber::fmt::SubscriberBuilder;
-use chrono::Utc;
-
 
 #[cxx::bridge]
 pub mod ffi {
@@ -29,47 +21,49 @@ pub mod ffi {
     }
 
     unsafe extern "C++" {
-        include!("Bridge.hpp");
-        type Emitter;
-        fn emit(
-            emitter: Pin<&mut Emitter>,
-            metadata: SerializedTupleBuffer,
-            data: &[u8],
-            children: &[&[u8]],
-        ) -> bool;
+        type TupleBufferBuilder;
+        fn set_metadata(self: Pin<&mut TupleBufferBuilder>, meta: &SerializedTupleBuffer);
+        fn set_data(self: Pin<&mut TupleBufferBuilder>, data: &[u8]);
+        fn add_child_buffer(self: Pin<&mut TupleBufferBuilder>, data: &[u8]);
     }
+
     extern "Rust" {
         type ReceiverServer;
         type SenderServer;
-        type Channel;
-        fn receiverInstance() -> Box<ReceiverServer>;
-        fn senderInstance() -> Box<SenderServer>;
+        type SenderChannel;
+        type ReceiverChannel;
 
-        fn registerReceiverChannel(
+        fn receiver_instance() -> Box<ReceiverServer>;
+        fn sender_instance() -> Box<SenderServer>;
+
+        fn enable_logging();
+
+        fn register_receiver_channel(
             server: &mut ReceiverServer,
             channel_identifier: String,
-            emitter: UniquePtr<Emitter>,
-        );
-        fn closeReceiverChannel(server: &mut ReceiverServer, channel_identifier: String);
-        fn registerSenderChannel(
+        ) -> Box<ReceiverChannel>;
+        fn receive_buffer(
+            receiver_channel: &mut ReceiverChannel,
+            builder: Pin<&mut TupleBufferBuilder>,
+        ) -> Result<()>;
+
+        fn close_receiver_channel(server: &mut ReceiverServer, channel_identifier: String);
+
+        fn register_sender_channel(
             server: &SenderServer,
             connection_identifier: u16,
             channel_identifier: String,
-        ) -> Box<Channel>;
-        fn closeSenderChannel(channel: Box<Channel>);
-        fn sendChannel(
-            channel: &Channel,
+        ) -> Box<SenderChannel>;
+
+        fn close_sender_channel(channel: Box<SenderChannel>);
+        fn send_channel(
+            channel: &SenderChannel,
             metadata: SerializedTupleBuffer,
             data: &[u8],
             children: &[&[u8]],
         ) -> Result<()>;
-
-        fn enable_logging();
     }
 }
-unsafe impl Send for ffi::Emitter {}
-unsafe impl Sync for ffi::Emitter {}
-
 lazy_static! {
     static ref SENDER: Arc<sender::NetworkService> = {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -97,24 +91,30 @@ pub struct ReceiverServer {
 struct SenderServer {
     handle: Arc<sender::NetworkService>,
 }
-struct Channel {
+struct SenderChannel {
     cancellation_token: CancellationToken,
-    data_queue: DataQueue,
+    data_queue: async_channel::Sender<TupleBuffer>,
 }
-fn receiverInstance() -> Box<ReceiverServer> {
+
+struct ReceiverChannel {
+    cancellation_token: CancellationToken,
+    data_queue: Box<async_channel::Receiver<TupleBuffer>>,
+}
+
+fn receiver_instance() -> Box<ReceiverServer> {
     Box::new(ReceiverServer {
         handle: RECEIVER.clone(),
         cancellation_tokens: HashMap::new(),
     })
 }
-fn senderInstance() -> Box<SenderServer> {
+fn sender_instance() -> Box<SenderServer> {
     Box::new(SenderServer {
         handle: SENDER.clone(),
     })
 }
 
-fn sendChannel(
-    channel: &Channel,
+fn send_channel(
+    channel: &SenderChannel,
     metadata: SerializedTupleBuffer,
     data: &[u8],
     children: &[&[u8]],
@@ -136,71 +136,69 @@ fn sendChannel(
     Ok(())
 }
 
-fn registerReceiverChannel(
+fn register_receiver_channel(
     server: &mut ReceiverServer,
     channel_identifier: String,
-    mut emitter: cxx::UniquePtr<ffi::Emitter>,
-) {
-    info!("registerReceiverChannel({})", channel_identifier);
-    let token = server
+) -> Box<ReceiverChannel> {
+    info!("register_receiver_channel({})", channel_identifier);
+    let (queue, token) = server
         .handle
-        .register_channel(
-            channel_identifier.clone(),
-            Box::new(move |buffer| {
-                let meta = ffi::SerializedTupleBuffer {
-                    sequence_number: buffer.sequence_number as usize,
-                    origin_id: buffer.origin_id as usize,
-                    chunk_number: buffer.chunk_number as usize,
-                    number_of_tuples: buffer.number_of_tuples as usize,
-                    last_chunk: buffer.last_chunk,
-                };
-
-                let child_buffers: Vec<_> = buffer
-                    .child_buffers
-                    .iter()
-                    .map(|buffer| buffer.as_ref())
-                    .collect();
-
-                emit(emitter.pin_mut(), meta, &buffer.data, &child_buffers)
-            }),
-        )
+        .register_channel(channel_identifier.clone())
         .unwrap();
-    server.cancellation_tokens.insert(channel_identifier, token);
+
+    Box::new(ReceiverChannel {
+        cancellation_token: token,
+        data_queue: Box::new(queue),
+    })
 }
-fn closeReceiverChannel(server: &mut ReceiverServer, channel_identifier: String) {
+
+fn receive_buffer(
+    receiver_channel: &mut ReceiverChannel,
+    mut builder: Pin<&mut ffi::TupleBufferBuilder>,
+) -> Result<(), Box<dyn Error>> {
+    let buffer = receiver_channel.data_queue.recv_blocking()?;
+    builder.as_mut().set_metadata(&SerializedTupleBuffer {
+        sequence_number: buffer.sequence_number as usize,
+        origin_id: buffer.origin_id as usize,
+        chunk_number: buffer.chunk_number as usize,
+        number_of_tuples: buffer.number_of_tuples as usize,
+        last_chunk: buffer.last_chunk,
+    });
+
+    builder.as_mut().set_data(&buffer.data);
+
+    for child_buffer in buffer.child_buffers.iter() {
+        builder.as_mut().add_child_buffer(&child_buffer);
+    }
+
+    Ok(())
+}
+fn close_receiver_channel(server: &mut ReceiverServer, channel_identifier: String) {
     server
         .cancellation_tokens
         .remove(&channel_identifier)
         .unwrap()
         .cancel();
 }
-fn registerSenderChannel(
+fn register_sender_channel(
     server: &SenderServer,
     connection_identifier: u16,
     channel_identifier: String,
-) -> Box<Channel> {
+) -> Box<SenderChannel> {
     let (cancellation_token, data_queue) = server
         .handle
         .register_channel(connection_identifier, channel_identifier)
         .unwrap();
-    Box::new(Channel {
+    Box::new(SenderChannel {
         cancellation_token,
         data_queue,
     })
 }
-fn closeSenderChannel(channel: Box<Channel>) {
+fn close_sender_channel(channel: Box<SenderChannel>) {
     channel.cancellation_token.cancel();
     while !(channel.data_queue.is_closed() || channel.data_queue.is_empty()) {}
 }
 
 fn enable_logging() {
-    SubscriberBuilder::default()
-        .with_env("RUST_LOG=info")
-        .with_timer("chrono")
-        .fmt(
-            "[{timestamp:.6?}] [{level}] [thread {thread_id}] [{file}:{line}] {message}",
-        )
-        .color_backtrace()
-        .color_level()
-        .init();
+    tracing_subscriber::fmt::init();
 }

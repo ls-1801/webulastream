@@ -1,4 +1,6 @@
 use crate::protocol::*;
+use crate::sender::DataQueue;
+use async_channel::SendError;
 use bytes::BytesMut;
 use std::collections::HashMap;
 use std::str::from_utf8;
@@ -20,11 +22,11 @@ pub struct NetworkService {
 }
 enum NetworkingServiceControl {
     Stop,
-    RetryChannel(ChannelIdentifier, EmitFn, CancellationToken),
+    RetryChannel(ChannelIdentifier, DataQueue, CancellationToken),
     RegisterChannel(
         ChannelIdentifier,
-        EmitFn,
-        tokio::sync::oneshot::Sender<CancellationToken>,
+        DataQueue,
+        oneshot::Sender<CancellationToken>,
     ),
 }
 type NetworkingServiceController = tokio::sync::mpsc::Sender<NetworkingServiceControl>;
@@ -33,10 +35,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type EmitFn = Box<dyn FnMut(TupleBuffer) -> bool + Send + Sync>;
 
-type RegisteredChannels = Arc<RwLock<HashMap<ChannelIdentifier, (EmitFn, CancellationToken)>>>;
+type RegisteredChannels = Arc<RwLock<HashMap<ChannelIdentifier, (DataQueue, CancellationToken)>>>;
 async fn channel_handler(
     cancellation_token: CancellationToken,
-    emit: &mut EmitFn,
+    queue: &mut DataQueue,
     listener: &mut TcpListener,
 ) -> Result<()> {
     let Some(Ok(Ok((mut stream, address)))) = cancellation_token
@@ -64,10 +66,19 @@ async fn channel_handler(
             }
         };
         let sequence = buf.sequence_number;
-        let response = if (emit(buf)) {
-            format!("OK {}\n", sequence)
-        } else {
-            format!("NOT OK {}\n", sequence)
+        let response = match cancellation_token
+            .run_until_cancelled(queue.send(buf))
+            .await
+        {
+            None => {
+                return Err("Cancelled".into());
+            }
+            Some(Ok(())) => {
+                format!("OK {}\n", sequence)
+            }
+            Some(Err(e)) => {
+                format!("NOT OK {}\n", sequence)
+            }
         };
 
         match cancellation_token
@@ -86,7 +97,7 @@ async fn channel_handler(
 }
 async fn create_channel_handler(
     channel_id: ChannelIdentifier,
-    mut emit: EmitFn,
+    mut queue: DataQueue,
     channel_cancellation_token: CancellationToken,
     control: NetworkingServiceController,
 ) -> Result<u16> {
@@ -107,7 +118,12 @@ async fn create_channel_handler(
 
             warn!(
                 "Channel Handler terminated: {:?}",
-                channel_handler(channel_cancellation_token.clone(), &mut emit, &mut listener).await
+                channel_handler(
+                    channel_cancellation_token.clone(),
+                    &mut queue,
+                    &mut listener
+                )
+                .await
             );
             if channel_cancellation_token.is_cancelled() {
                 return;
@@ -117,7 +133,7 @@ async fn create_channel_handler(
             control
                 .send(NetworkingServiceControl::RetryChannel(
                     channel,
-                    emit,
+                    queue,
                     channel_cancellation_token,
                 ))
                 .await
@@ -230,9 +246,9 @@ impl NetworkService {
     pub fn register_channel(
         self: &Arc<NetworkService>,
         channel: ChannelIdentifier,
-        emit: EmitFn,
-    ) -> Result<CancellationToken> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+    ) -> Result<(async_channel::Receiver<TupleBuffer>, CancellationToken)> {
+        let (data_queue_sender, data_queue_receiver) = async_channel::bounded(10);
+        let (tx, rx) = oneshot::channel();
         self.runtime
             .lock()
             .unwrap()
@@ -241,12 +257,16 @@ impl NetworkService {
             .block_on(async move {
                 if let Err(e) = self
                     .sender
-                    .send(NetworkingServiceControl::RegisterChannel(channel, emit, tx))
+                    .send(NetworkingServiceControl::RegisterChannel(
+                        channel,
+                        data_queue_sender,
+                        tx,
+                    ))
                     .await
                 {
                     return Err(e);
                 }
-                Ok(rx.await.unwrap())
+                Ok((data_queue_receiver, rx.await.unwrap()))
             })
             .map_err(|e| format!("Could not register channel: {e}").as_str().into())
     }

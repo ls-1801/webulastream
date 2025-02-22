@@ -5,14 +5,15 @@
         type: Source
         downstream_channel: channel_1
         downstream_connection: 8001
+        ingestion_rate_in_milliseconds: 10
     - type: Wait
-      millis: 50000
+      millis: 20000
 - connection: 8001
   commands:
     - type: StartQuery
       q:
         type: Sink
         input_channel: channel_1
-        ingestion_rate_in_milliseconds: 300
+        ingestion_rate_in_milliseconds: 1000
     - type: Wait
-      millis: 50000
+      millis: 20000
