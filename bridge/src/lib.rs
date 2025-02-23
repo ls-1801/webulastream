@@ -1,4 +1,4 @@
-use crate::ffi::SerializedTupleBuffer;
+use async_channel::TrySendError;
 use distributed::protocol::{ChannelIdentifier, TupleBuffer};
 use distributed::*;
 use lazy_static::lazy_static;
@@ -12,6 +12,11 @@ use tracing::info;
 
 #[cxx::bridge]
 pub mod ffi {
+    enum SendResult {
+        Ok,
+        Error,
+        Full,
+    }
     struct SerializedTupleBuffer {
         sequence_number: usize,
         origin_id: usize,
@@ -21,6 +26,7 @@ pub mod ffi {
     }
 
     unsafe extern "C++" {
+        include!("Bridge.hpp");
         type TupleBufferBuilder;
         fn set_metadata(self: Pin<&mut TupleBufferBuilder>, meta: &SerializedTupleBuffer);
         fn set_data(self: Pin<&mut TupleBufferBuilder>, data: &[u8]);
@@ -56,12 +62,13 @@ pub mod ffi {
         ) -> Box<SenderChannel>;
 
         fn close_sender_channel(channel: Box<SenderChannel>);
+        fn sender_writes_pending(channel: &SenderChannel) -> bool;
         fn send_channel(
             channel: &SenderChannel,
             metadata: SerializedTupleBuffer,
             data: &[u8],
             children: &[&[u8]],
-        ) -> Result<()>;
+        ) -> SendResult;
     }
 }
 lazy_static! {
@@ -113,29 +120,6 @@ fn sender_instance() -> Box<SenderServer> {
     })
 }
 
-fn send_channel(
-    channel: &SenderChannel,
-    metadata: SerializedTupleBuffer,
-    data: &[u8],
-    children: &[&[u8]],
-) -> Result<(), Box<dyn Error>> {
-    info!("Sending data through channel");
-    let buffer = TupleBuffer {
-        sequence_number: metadata.sequence_number as u64,
-        origin_id: metadata.origin_id as u64,
-        chunk_number: metadata.chunk_number as u64,
-        number_of_tuples: metadata.number_of_tuples as u64,
-        last_chunk: metadata.last_chunk,
-        data: Bytes::copy_from_slice(data),
-        child_buffers: children
-            .iter()
-            .map(|bytes| Bytes::copy_from_slice(bytes))
-            .collect(),
-    };
-    channel.data_queue.try_send(buffer)?;
-    Ok(())
-}
-
 fn register_receiver_channel(
     server: &mut ReceiverServer,
     channel_identifier: String,
@@ -157,7 +141,7 @@ fn receive_buffer(
     mut builder: Pin<&mut ffi::TupleBufferBuilder>,
 ) -> Result<(), Box<dyn Error>> {
     let buffer = receiver_channel.data_queue.recv_blocking()?;
-    builder.as_mut().set_metadata(&SerializedTupleBuffer {
+    builder.as_mut().set_metadata(&ffi::SerializedTupleBuffer {
         sequence_number: buffer.sequence_number as usize,
         origin_id: buffer.origin_id as usize,
         chunk_number: buffer.chunk_number as usize,
@@ -166,9 +150,10 @@ fn receive_buffer(
     });
 
     builder.as_mut().set_data(&buffer.data);
-
+    
     for child_buffer in buffer.child_buffers.iter() {
-        builder.as_mut().add_child_buffer(&child_buffer);
+        assert!(!child_buffer.is_empty());
+        builder.as_mut().add_child_buffer(child_buffer);
     }
 
     Ok(())
@@ -193,6 +178,36 @@ fn register_sender_channel(
         cancellation_token,
         data_queue,
     })
+}
+fn send_channel(
+    channel: &SenderChannel,
+    metadata: ffi::SerializedTupleBuffer,
+    data: &[u8],
+    children: &[&[u8]],
+) -> ffi::SendResult {
+    let buffer = TupleBuffer {
+        sequence_number: metadata.sequence_number as u64,
+        origin_id: metadata.origin_id as u64,
+        chunk_number: metadata.chunk_number as u64,
+        number_of_tuples: metadata.number_of_tuples as u64,
+        last_chunk: metadata.last_chunk,
+        data: Vec::from(data),
+        child_buffers: children
+            .iter()
+            .map(|bytes| Vec::from(*bytes))
+            .collect(),
+    };
+    match channel.data_queue.try_send(buffer) {
+        Ok(()) => ffi::SendResult::Ok,
+        Err(TrySendError::Full(_)) => ffi::SendResult::Full,
+        Err(TrySendError::Closed(_)) => ffi::SendResult::Error,
+    }
+}
+fn sender_writes_pending(channel: &SenderChannel) -> bool {
+    if channel.data_queue.is_closed() {
+        return false;
+    }
+    !channel.data_queue.is_empty()
 }
 fn close_sender_channel(channel: Box<SenderChannel>) {
     channel.cancellation_token.cancel();

@@ -6,15 +6,17 @@ use crate::engine::{
     EmitFn, ExecutablePipeline, Node, PipelineContext, Query, QueryEngine, SourceImpl, SourceNode,
 };
 use async_channel::{RecvError, TryRecvError, TrySendError};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
 use distributed::{receiver, sender};
-use log::{error};
+use log::error;
 use std::collections::VecDeque;
+use std::io::prelude::*;
+use std::io::Cursor;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 use std::{sync, thread};
@@ -58,15 +60,12 @@ fn verify_tuple_buffer(received: &TupleBuffer) -> bool {
     // Reconstruct child buffers
     let mut expected_child_buffers = vec![];
     for idx in 0..(counter % 3) {
-        let capacity = ((idx + 1) * (10 * counter)) % 8192;
-        let mut buffer = BytesMut::with_capacity(capacity);
-        let value_bytes = counter.to_le_bytes();
-
-        while buffer.len() + size_of::<usize>() <= buffer.capacity() {
-            buffer.put(&value_bytes[..]);
+        let buffer = vec![0u8; ((idx + 1) * (10 * counter)) % 8192];
+        let mut cursor = Cursor::new(buffer);
+        while cursor.has_remaining() {
+            cursor.write_all(&counter.to_le_bytes()).unwrap();
         }
-
-        expected_child_buffers.push(buffer.freeze());
+        expected_child_buffers.push(cursor.into_inner());
     }
 
     // Verify child buffers
@@ -305,22 +304,20 @@ impl SourceImpl for GeneratorSource {
             move |stopped| {
                 let mut counter = 0_usize;
                 while !stopped.load(Acquire) {
-                    let mut buffer = BytesMut::with_capacity(8192);
-                    let value_bytes = counter.to_le_bytes(); // Use `to_be_bytes()` for big-endian
-                    while buffer.len() + size_of::<usize>() <= buffer.capacity() {
-                        buffer.put(&value_bytes[..]);
+                    let buffer = vec![0u8; 8192];
+                    let mut cursor = Cursor::new(buffer);
+                    while cursor.has_remaining() {
+                        cursor.write_all(&counter.to_le_bytes()).unwrap();
                     }
-                    let buffer = buffer.freeze();
 
                     let mut child_buffers = vec![];
                     for idx in 0..(counter % 3) {
-                        let mut buffer =
-                            BytesMut::with_capacity(((idx + 1) * (10 * counter)) % 8192);
-                        let value_bytes = counter.to_le_bytes(); // Use `to_be_bytes()` for big-endian
-                        while buffer.len() + size_of::<usize>() <= buffer.capacity() {
-                            buffer.put(&value_bytes[..]);
+                        let buffer = vec![0u8; ((idx + 1) * (10 * counter)) % 8192];
+                        let mut cursor = Cursor::new(buffer);
+                        while cursor.has_remaining() {
+                            cursor.write_all(&counter.to_le_bytes()).unwrap();
                         }
-                        child_buffers.push(buffer.freeze());
+                        child_buffers.push(cursor.into_inner());
                     }
 
                     counter += 1;
@@ -330,7 +327,7 @@ impl SourceImpl for GeneratorSource {
                         chunk_number: 1,
                         number_of_tuples: 1,
                         last_chunk: true,
-                        data: buffer,
+                        data: cursor.into_inner(),
                         child_buffers,
                     });
                     sleep(interval);
