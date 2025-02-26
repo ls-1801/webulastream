@@ -45,7 +45,7 @@ fn verify_tuple_buffer(received: &TupleBuffer) -> bool {
     let counter = (received.sequence_number - 1) as usize;
 
     // Reconstruct main buffer
-    let mut expected_buffer = BytesMut::with_capacity(8192);
+    let mut expected_buffer = BytesMut::with_capacity(16);
     let value_bytes = counter.to_le_bytes();
 
     while expected_buffer.len() + size_of::<usize>() <= expected_buffer.capacity() {
@@ -60,7 +60,7 @@ fn verify_tuple_buffer(received: &TupleBuffer) -> bool {
     // Reconstruct child buffers
     let mut expected_child_buffers = vec![];
     for idx in 0..(counter % 3) {
-        let buffer = vec![0u8; ((idx + 1) * (10 * counter)) % 8192];
+        let buffer = vec![0u8; ((idx + 1) * (10 * counter)) % 16];
         let mut cursor = Cursor::new(buffer);
         while cursor.has_remaining() {
             cursor.write_all(&counter.to_le_bytes()).unwrap();
@@ -108,7 +108,7 @@ struct NetworkSink {
     service: Arc<sender::NetworkService>,
     connection: ConnectionIdentifier,
     channel: ChannelIdentifier,
-    queue: sync::RwLock<Option<(CancellationToken, sender::DataQueue)>>,
+    queue: sync::RwLock<Option<(CancellationToken, sender::ChannelControlQueue)>>,
     buffer: std::sync::RwLock<VecDeque<TupleBuffer>>,
 }
 
@@ -136,7 +136,7 @@ impl ExecutablePipeline for NetworkSink {
                 info!("Network Sink Setup");
                 write_locked.replace(
                     self.service
-                        .register_channel(self.connection, self.channel.clone())
+                        .register_channel(self.connection.clone(), self.channel.clone())
                         .unwrap(),
                 );
                 info!("Network Sink Setup Done");
@@ -156,9 +156,9 @@ impl ExecutablePipeline for NetworkSink {
                         .as_ref()
                         .unwrap()
                         .1
-                        .try_send(front)
+                        .try_send(sender::ChannelControlMessage::Data(front))
                     {
-                        Err(TrySendError::Full(data)) => {
+                        Err(TrySendError::Full(sender::ChannelControlMessage::Data(data))) => {
                             locked.push_front(data);
                             return;
                         }
@@ -178,9 +178,9 @@ impl ExecutablePipeline for NetworkSink {
             .as_ref()
             .unwrap()
             .1
-            .try_send(data.clone())
+            .try_send(sender::ChannelControlMessage::Data(data.clone()))
         {
-            Err(TrySendError::Full(data)) => {
+            Err(TrySendError::Full(sender::ChannelControlMessage::Data(data))) => {
                 self.buffer.write().unwrap().push_back(data);
             }
             Err(TrySendError::Closed(_)) => {
@@ -304,7 +304,7 @@ impl SourceImpl for GeneratorSource {
             move |stopped| {
                 let mut counter = 0_usize;
                 while !stopped.load(Acquire) {
-                    let buffer = vec![0u8; 8192];
+                    let buffer = vec![0u8; 16];
                     let mut cursor = Cursor::new(buffer);
                     while cursor.has_remaining() {
                         cursor.write_all(&counter.to_le_bytes()).unwrap();
@@ -312,7 +312,7 @@ impl SourceImpl for GeneratorSource {
 
                     let mut child_buffers = vec![];
                     for idx in 0..(counter % 3) {
-                        let buffer = vec![0u8; ((idx + 1) * (10 * counter)) % 8192];
+                        let buffer = vec![0u8; ((idx + 1) * (10 * counter)) % 16];
                         let mut cursor = Cursor::new(buffer);
                         while cursor.has_remaining() {
                             cursor.write_all(&counter.to_le_bytes()).unwrap();

@@ -1,15 +1,19 @@
-use std::collections::HashMap;
+use crate::protocol;
+use crate::protocol::*;
+use futures::SinkExt;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::runtime::Runtime;
+use tokio::select;
+use tokio::sync::oneshot;
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, info_span, warn, Instrument};
+use tracing_subscriber::fmt::format;
 
-use crate::protocol::*;
-
-pub type DataQueue = async_channel::Sender<TupleBuffer>;
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub struct NetworkService {
@@ -22,20 +26,22 @@ enum NetworkingServiceControlMessage {
     RegisterChannel(
         ConnectionIdentifier,
         ChannelIdentifier,
-        tokio::sync::oneshot::Sender<(CancellationToken, DataQueue)>,
+        oneshot::Sender<(CancellationToken, ChannelControlQueue)>,
     ),
 }
 enum NetworkingConnectionControlMessage {
     RegisterChannel(
         ChannelIdentifier,
-        tokio::sync::oneshot::Sender<(CancellationToken, DataQueue)>,
+        oneshot::Sender<(CancellationToken, ChannelControlQueue)>,
     ),
     RetryChannel(
         ChannelIdentifier,
         CancellationToken,
-        async_channel::Receiver<TupleBuffer>,
+        channel_handler::ChannelControlQueueListener,
     ),
 }
+pub type ChannelControlMessage = channel_handler::ChannelControlMessage;
+pub type ChannelControlQueue = channel_handler::ChannelControlQueue;
 type NetworkingServiceController = tokio::sync::mpsc::Sender<NetworkingServiceControlMessage>;
 type NetworkingServiceControlListener =
     tokio::sync::mpsc::Receiver<NetworkingServiceControlMessage>;
@@ -49,79 +55,208 @@ enum ChannelHandlerResult {
     Closed,
 }
 
-// fn try_read_response(
-//     mut reader: &mut TcpStream,
-//     buffer: &mut BytesMut,
-// ) -> Result<Vec<DataResponse>> {
-//     let mut responses = vec![];
-//     loop {
-//         let n = match reader.try_read_buf(buffer) {
-//             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-//                 break;
-//             }
-//             Err(e) => {
-//                 error!("Error while waiting for response: {e:?}");
-//                 return Err(e.into());
-//             }
-//             Ok(0) => return Err("Connection closed".into()),
-//             Ok(n) => n,
-//         };
-//
-//         let txt_responses =
-//             from_utf8(&buffer[..]).map_err(|e| "Protocol Error expected utf8 response")?;
-//         let mut index = 0;
-//         {
-//             let txt_responses = txt_responses.split('\n').collect::<Vec<_>>();
-//             for response in txt_responses.into_iter().rev().skip(1).rev() {
-//                 index += response.len() + 1;
-//                 if response.starts_with("OK ") {
-//                     let seq = response
-//                         .strip_prefix("OK ")
-//                         .unwrap()
-//                         .parse::<u64>()
-//                         .map_err(|e| "Protocol Error expected sequence number in response")?;
-//                     responses.push(DataResponse::Ok(seq));
-//                 } else if response.starts_with("NOT OK ") {
-//                     let seq = response
-//                         .strip_prefix("NOT OK ")
-//                         .unwrap()
-//                         .parse::<u64>()
-//                         .map_err(|e| "Protocol Error expected sequence number in response")?;
-//                     responses.push(DataResponse::NotOk(seq));
-//                 } else {
-//                     return Err("Protocol Error expected \"OK <seq>\"/ \"NOT OK <seq>\"".into());
-//                 }
-//             }
-//         }
-//
-//         let (beginning, end) = buffer[..].split_at_mut(index);
-//         let length = end.len();
-//         beginning[0..length].copy_from_slice(end);
-//         buffer.resize(length, 0);
-//     }
-//     Ok(responses)
-// }
+mod channel_handler {
+    use crate::protocol;
+    use crate::protocol::{
+        DataChannelRequest, DataChannelResponse, DataChannelSenderReader, DataChannelSenderWriter,
+        TupleBuffer,
+    };
+    use futures::SinkExt;
+    use std::collections::{HashMap, VecDeque};
+    use tokio::net::TcpStream;
+    use tokio::select;
+    use tokio::sync::oneshot;
+    use tokio_stream::StreamExt;
+    use tokio_util::sync::CancellationToken;
+    use tracing::info;
+
+    const MAX_PENDING_ACKS: usize = 64;
+
+    pub enum ChannelControlMessage {
+        Data(TupleBuffer),
+        Flush(oneshot::Sender<()>),
+        Terminate,
+    }
+    pub type ChannelControlQueue = async_channel::Sender<ChannelControlMessage>;
+    pub(super) type ChannelControlQueueListener = async_channel::Receiver<ChannelControlMessage>;
+    pub(super) enum ChannelHandlerError {
+        ClosedByOtherSide,
+        ConnectionLost(Box<dyn std::error::Error + Send + Sync>),
+        Protocol(Box<dyn std::error::Error + Send + Sync>),
+        Cancelled,
+        Terminated,
+    }
+    pub(super) struct ChannelHandler {
+        cancellation_token: CancellationToken,
+        pending_writes: VecDeque<TupleBuffer>,
+        wait_for_ack: HashMap<u64, TupleBuffer>,
+        writer: DataChannelSenderWriter,
+        reader: DataChannelSenderReader,
+        queue: ChannelControlQueueListener,
+    }
+
+    type Result<T> = core::result::Result<T, ChannelHandlerError>;
+
+    impl ChannelHandler {
+        pub fn new(
+            cancellation_token: CancellationToken,
+            stream: TcpStream,
+            queue: ChannelControlQueueListener,
+        ) -> Self {
+            let (reader, writer) = protocol::data_channel_sender(stream);
+
+            Self {
+                cancellation_token,
+                pending_writes: Default::default(),
+                wait_for_ack: Default::default(),
+                reader,
+                writer,
+                queue,
+            }
+        }
+
+        async fn handle_request(
+            &mut self,
+            channel_control_message: ChannelControlMessage,
+        ) -> Result<()> {
+            match channel_control_message {
+                ChannelControlMessage::Data(data) => self.pending_writes.push_back(data),
+                ChannelControlMessage::Flush(done) => {
+                    self.flush().await?;
+                    let _ = done.send(());
+                }
+                ChannelControlMessage::Terminate => {
+                    let _ = self.writer.send(DataChannelRequest::Close).await;
+                    return Err(ChannelHandlerError::Terminated);
+                }
+            }
+            Ok(())
+        }
+        fn handle_response(&mut self, response: DataChannelResponse) -> Result<()> {
+            match response {
+                DataChannelResponse::Close => {
+                    info!("Channel Closed by other receiver");
+                    return Err(ChannelHandlerError::ClosedByOtherSide);
+                }
+                DataChannelResponse::NAckData(seq) => {
+                    if let Some(write) = self.wait_for_ack.remove(&seq) {
+                        info!("NAck for {seq}");
+                        self.pending_writes.push_back(write);
+                    } else {
+                        return Err(ChannelHandlerError::Protocol(
+                            format!("Protocol Error. Unknown Seq {seq}").into(),
+                        ));
+                    }
+                }
+                DataChannelResponse::AckData(seq) => {
+                    let Some(_) = self.wait_for_ack.remove(&seq) else {
+                        return Err(ChannelHandlerError::Protocol(
+                            format!("Protocol Error. Unknown Seq {seq}").into(),
+                        ));
+                    };
+                    info!("Ack for {seq}");
+                }
+            }
+
+            Ok(())
+        }
+
+        async fn send_pending(
+            writer: &mut DataChannelSenderWriter,
+            pending_writes: &mut VecDeque<TupleBuffer>,
+            wait_for_ack: &mut HashMap<u64, TupleBuffer>,
+        ) -> Result<()> {
+            if pending_writes.is_empty() {
+                return Ok(());
+            }
+
+            if (writer
+                .feed(DataChannelRequest::Data(
+                    pending_writes
+                        .front()
+                        .expect("BUG: check value eralier")
+                        .clone(),
+                ))
+                .await)
+                .is_ok()
+            {
+                wait_for_ack.insert(
+                    pending_writes
+                        .front()
+                        .expect("BUG: checked value earlier")
+                        .sequence_number,
+                    pending_writes
+                        .pop_front()
+                        .expect("BUG: checked value earlier"),
+                );
+            }
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<()> {
+            while !self.pending_writes.is_empty() || !self.wait_for_ack.is_empty() {
+                self.writer
+                    .flush()
+                    .await
+                    .map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?;
+                if self.cancellation_token.is_cancelled() {
+                    return Err(ChannelHandlerError::Cancelled);
+                }
+
+                if self.pending_writes.is_empty() || self.wait_for_ack.len() >= MAX_PENDING_ACKS {
+                    select! {
+                        _ = self.cancellation_token.cancelled() => {return Err(ChannelHandlerError::Cancelled);},
+                        response = self.reader.next() => self.handle_response(response.ok_or(ChannelHandlerError::ClosedByOtherSide)?.map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?)?,
+                    }
+                } else {
+                    select! {
+                        _ = self.cancellation_token.cancelled() => {return Err(ChannelHandlerError::Cancelled);},
+                        response = self.reader.next() => self.handle_response(response.ok_or(ChannelHandlerError::ClosedByOtherSide)?.map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?)?,
+                        send_result = Self::send_pending(&mut self.writer, &mut self.pending_writes, &mut self.wait_for_ack) => send_result?,
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        pub(super) async fn run(&mut self) -> Result<()> {
+            loop {
+                if self.cancellation_token.is_cancelled() {
+                    return Err(ChannelHandlerError::Cancelled);
+                }
+
+                if self.pending_writes.is_empty() || self.wait_for_ack.len() >= MAX_PENDING_ACKS {
+                    select! {
+                        _ = self.cancellation_token.cancelled() => {return Err(ChannelHandlerError::Cancelled);},
+                        response = self.reader.next() => self.handle_response(response.ok_or(ChannelHandlerError::ClosedByOtherSide)?.map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?)?,
+                        request = self.queue.recv() => self.handle_request(request.map_err(|_| ChannelHandlerError::Cancelled)?).await?,
+                    }
+                } else {
+                    select! {
+                        _ = self.cancellation_token.cancelled() => {return Err(ChannelHandlerError::Cancelled);},
+                        response = self.reader.next() => self.handle_response(response.ok_or(ChannelHandlerError::ClosedByOtherSide)?.map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?)?,
+                        request = self.queue.recv() => self.handle_request(request.map_err(|_| ChannelHandlerError::Cancelled)?).await?,
+                        send_result = Self::send_pending(&mut self.writer, &mut self.pending_writes, &mut self.wait_for_ack) => send_result?,
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn channel_handler(
     cancellation_token: CancellationToken,
-    port: u16,
-    queue: async_channel::Receiver<TupleBuffer>,
+    channel_address: SocketAddr,
+    queue: channel_handler::ChannelControlQueueListener,
 ) -> ChannelHandlerResult {
-    let mut wait_for_ack = HashMap::new();
-    let window_size = 32;
-
     let socket = match TcpSocket::new_v4() {
         Ok(socket) => socket,
         Err(e) => return ChannelHandlerResult::ConnectionLost("Could not create socket".into()),
     };
 
-    let mut connection = match cancellation_token
-        .run_until_cancelled(
-            socket.connect(
-                format!("127.0.0.1:{port}")
-                    .parse()
-                    .expect("Invalid IP Address"),
-            ),
-        )
+    let connection = match cancellation_token
+        .run_until_cancelled(socket.connect(channel_address))
         .await
     {
         None => return ChannelHandlerResult::Cancelled,
@@ -129,82 +264,32 @@ async fn channel_handler(
         Some(Ok(connection)) => connection,
     };
 
-    let mut pending_writes: Vec<TupleBuffer> = vec![];
-    loop {
-        let mut responses: Vec<DataResponse> = vec![];
-        loop {
-            match cancellation_token
-                .run_until_cancelled(try_read_message(&mut connection))
-                .await
-            {
-                None => return ChannelHandlerResult::Cancelled,
-                Some(Ok(None)) => break,
-                Some(Ok(Some(response))) => responses.push(response),
-                Some(Err(e)) => return ChannelHandlerResult::ConnectionLost(e.into()),
-            }
+    let mut handler = channel_handler::ChannelHandler::new(cancellation_token, connection, queue);
+    match handler.run().await {
+        Ok(_) => ChannelHandlerResult::Closed,
+        Err(channel_handler::ChannelHandlerError::Terminated) => ChannelHandlerResult::Closed,
+        Err(channel_handler::ChannelHandlerError::ClosedByOtherSide) => {
+            ChannelHandlerResult::Closed
         }
-
-        for response in responses {
-            match response {
-                DataResponse::Closed => {
-                    info!("Channel Closed by other receiver");
-                    return ChannelHandlerResult::Closed;
-                }
-                DataResponse::AckData(seq) => {
-                    info!("Ack for {seq}");
-                    wait_for_ack.remove(&seq);
-                }
-                DataResponse::NAckData(seq) => {
-                    let Some(write) = wait_for_ack.remove(&seq) else {
-                        return ChannelHandlerResult::ConnectionLost(
-                            "Protocol Error: Receiver acknowledged a sequence that does not exist"
-                                .into(),
-                        );
-                    };
-                    pending_writes.push(write);
-                }
-            }
+        Err(channel_handler::ChannelHandlerError::Cancelled) => ChannelHandlerResult::Cancelled,
+        Err(channel_handler::ChannelHandlerError::ConnectionLost(e)) => {
+            ChannelHandlerResult::ConnectionLost(e.into())
         }
-        for pending_write in pending_writes {
-            match cancellation_token
-                .run_until_cancelled(send_message(&mut connection, &pending_write))
-                .await
-            {
-                None => {
-                    return ChannelHandlerResult::Cancelled;
-                }
-                Some(Ok(())) => {
-                    info!("Data was sent!");
-                    wait_for_ack.insert(pending_write.sequence_number, pending_write);
-                }
-                Some(Err(e)) => {
-                    return ChannelHandlerResult::ConnectionLost(e.into());
-                }
-            }
+        Err(channel_handler::ChannelHandlerError::Protocol(e)) => {
+            ChannelHandlerResult::ConnectionLost(e.into())
         }
-        pending_writes = vec![];
-
-        while wait_for_ack.len() < window_size {
-            match queue.try_recv() {
-                Err(async_channel::TryRecvError::Empty) => break,
-                Ok(data) => {
-                    pending_writes.push(data);
-                }
-                Err(async_channel::TryRecvError::Closed) => {
-                    return ChannelHandlerResult::Closed;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 enum EstablishChannelResult {
     Ok(CancellationToken),
-    ChannelReject(ChannelIdentifier, async_channel::Receiver<TupleBuffer>),
+    ChannelReject(
+        ChannelIdentifier,
+        channel_handler::ChannelControlQueueListener,
+    ),
     BadConnection(
         ChannelIdentifier,
-        async_channel::Receiver<TupleBuffer>,
+        channel_handler::ChannelControlQueueListener,
         Error,
     ),
     BadProtocol,
@@ -212,17 +297,19 @@ enum EstablishChannelResult {
 }
 
 async fn establish_channel(
-    connection: &mut TcpStream,
+    control_channel_sender_writer: &mut ControlChannelSenderWriter,
+    control_channel_sender_reader: &mut ControlChannelSenderReader,
+    connection_identifier: &ConnectionIdentifier,
     channel: ChannelIdentifier,
     channel_cancellation_token: CancellationToken,
-    queue: async_channel::Receiver<TupleBuffer>,
+    queue: channel_handler::ChannelControlQueueListener,
     controller: NetworkingConnectionController,
 ) -> EstablishChannelResult {
     match channel_cancellation_token
-        .run_until_cancelled(send_message(
-            connection,
-            &ControlChannelRequests::ChannelRequest(channel.clone()),
-        ))
+        .run_until_cancelled(
+            control_channel_sender_writer
+                .send(ControlChannelRequest::ChannelRequest(channel.clone())),
+        )
         .await
     {
         None => return EstablishChannelResult::Cancelled,
@@ -237,23 +324,40 @@ async fn establish_channel(
     };
 
     let port = match channel_cancellation_token
-        .run_until_cancelled(read_message(connection))
+        .run_until_cancelled(control_channel_sender_reader.next())
         .await
     {
-        Some(Ok(ChannelResponse::OkChannelResponse(port))) => port,
-        Some(Ok(ChannelResponse::DenyChannelResponse)) => {
+        Some(Some(Ok(ControlChannelResponse::OkChannelResponse(port)))) => port,
+        Some(Some(Ok(ControlChannelResponse::DenyChannelResponse))) => {
             return EstablishChannelResult::ChannelReject(channel, queue)
         }
-        Some(Err(e)) => return EstablishChannelResult::BadConnection(channel, queue, e),
+        Some(Some(Err(e))) => {
+            return EstablishChannelResult::BadConnection(channel, queue, e.into())
+        }
+        Some(None) => {
+            return EstablishChannelResult::BadConnection(
+                channel,
+                queue,
+                "Connection closed".into(),
+            )
+        }
         None => return EstablishChannelResult::Cancelled,
     };
+
+    let channel_address = connection_identifier.parse::<SocketAddr>().expect("The Connection identifier should not be an invalid address, as the connection should have already been established");
+    let channel_address = SocketAddr::new(channel_address.ip(), port);
 
     tokio::spawn(
         {
             let channel = channel.clone();
             let channel_cancellation_token = channel_cancellation_token.clone();
             async move {
-                match channel_handler(channel_cancellation_token.clone(), port, queue.clone()).await
+                match channel_handler(
+                    channel_cancellation_token.clone(),
+                    channel_address,
+                    queue.clone(),
+                )
+                .await
                 {
                     ChannelHandlerResult::Cancelled => {
                         return;
@@ -298,7 +402,7 @@ async fn accept_channel_requests(
     Vec<(
         ChannelIdentifier,
         CancellationToken,
-        async_channel::Receiver<TupleBuffer>,
+        channel_handler::ChannelControlQueueListener,
     )>,
 > {
     let mut pending = vec![];
@@ -345,14 +449,14 @@ async fn accept_channel_requests(
 
 async fn connection_handler(
     connection_cancellation_token: CancellationToken,
-    connection: ConnectionIdentifier,
+    connection_identifier: ConnectionIdentifier,
     controller: NetworkingConnectionController,
     mut listener: NetworkingConnectionControlListener,
 ) -> Result<()> {
     let mut pending_channels: Vec<(
         ChannelIdentifier,
         CancellationToken,
-        async_channel::Receiver<TupleBuffer>,
+        channel_handler::ChannelControlQueueListener,
     )> = vec![];
     let mut active_channel: HashMap<ChannelIdentifier, CancellationToken> = HashMap::default();
     let on_cancel = |active_channel: HashMap<ChannelIdentifier, CancellationToken>| {
@@ -379,7 +483,7 @@ async fn connection_handler(
 
         let socket = TcpSocket::new_v4()?;
         let mut connection = match connection_cancellation_token
-            .run_until_cancelled(socket.connect(format!("127.0.0.1:{connection}").parse()?))
+            .run_until_cancelled(socket.connect(connection_identifier.parse()?))
             .await
         {
             None => return on_cancel(active_channel),
@@ -391,6 +495,8 @@ async fn connection_handler(
                 continue;
             }
         };
+
+        let (mut reader, mut writer) = protocol::control_channel_sender(connection);
 
         retry = 0;
 
@@ -420,7 +526,9 @@ async fn connection_handler(
                 }
                 match connection_cancellation_token
                     .run_until_cancelled(establish_channel(
-                        &mut connection,
+                        &mut writer,
+                        &mut reader,
+                        &connection_identifier,
                         channel.clone(),
                         channel_cancellation_token.clone(),
                         queue,
@@ -463,24 +571,27 @@ async fn connection_handler(
     }
 }
 async fn create_connection(
-    connection: ConnectionIdentifier,
+    connection: &ConnectionIdentifier,
 ) -> Result<(CancellationToken, NetworkingConnectionController)> {
     let (tx, rx) = tokio::sync::mpsc::channel::<NetworkingConnectionControlMessage>(1024);
     let control = tx.clone();
     let token = tokio_util::sync::CancellationToken::new();
-    tokio::spawn({
-        let token = token.clone();
-        async move {
-            info!(
-                "Connection is terminated: {:?}",
-                connection_handler(token, connection, control, rx).await
-            );
+    tokio::spawn(
+        {
+            let token = token.clone();
+            let connection = connection.clone();
+            async move {
+                info!(
+                    "Connection is terminated: {:?}",
+                    connection_handler(token, connection, control, rx).await
+                );
+            }
         }
         .instrument(tracing::info_span!(
             "connection_handler",
-            connection = connection
-        ))
-    });
+            connection = connection.clone()
+        )),
+    );
     Ok((token, tx))
 }
 
@@ -488,15 +599,19 @@ async fn network_sender_dispatcher(
     cancellation_token: CancellationToken,
     mut control: NetworkingServiceControlListener,
 ) -> Result<()> {
-    let mut connections: HashMap<u16, (CancellationToken, NetworkingConnectionController)> =
-        HashMap::default();
-    let on_cancel =
-        |active_channel: HashMap<u16, (CancellationToken, NetworkingConnectionController)>| {
-            active_channel
-                .into_iter()
-                .for_each(|(_, (token, _))| token.cancel());
-            return Ok(());
-        };
+    let mut connections: HashMap<
+        ConnectionIdentifier,
+        (CancellationToken, NetworkingConnectionController),
+    > = HashMap::default();
+    let on_cancel = |active_channel: HashMap<
+        ConnectionIdentifier,
+        (CancellationToken, NetworkingConnectionController),
+    >| {
+        active_channel
+            .into_iter()
+            .for_each(|(_, (token, _))| token.cancel());
+        return Ok(());
+    };
 
     loop {
         match cancellation_token.run_until_cancelled(control.recv()).await {
@@ -509,12 +624,12 @@ async fn network_sender_dispatcher(
             ))) => {
                 if !connections.contains_key(&connection) {
                     match cancellation_token
-                        .run_until_cancelled(create_connection(connection))
+                        .run_until_cancelled(create_connection(&connection))
                         .await
                     {
                         None => return on_cancel(connections),
                         Some(Ok((token, controller))) => {
-                            connections.insert(connection, (token, controller));
+                            connections.insert(connection.clone(), (token, controller));
                         }
                         Some(Err(e)) => {
                             return Err(e);
@@ -570,7 +685,7 @@ impl NetworkService {
         self: &Arc<NetworkService>,
         connection: ConnectionIdentifier,
         channel: ChannelIdentifier,
-    ) -> Result<(CancellationToken, DataQueue)> {
+    ) -> Result<(CancellationToken, channel_handler::ChannelControlQueue)> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.runtime
             .lock()

@@ -1,7 +1,10 @@
-use async_channel::TrySendError;
-use distributed::protocol::{ChannelIdentifier, TupleBuffer};
+use async_channel::{RecvError, SendError, TrySendError};
+use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
+use distributed::sender::{ChannelControlMessage, ChannelControlQueue};
 use distributed::*;
 use lazy_static::lazy_static;
+use once_cell::sync;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::pin::Pin;
@@ -39,7 +42,8 @@ pub mod ffi {
         type SenderChannel;
         type ReceiverChannel;
 
-        fn receiver_instance() -> Box<ReceiverServer>;
+        fn receiver_instance() -> Result<Box<ReceiverServer>>;
+        fn init_receiver_server(connection_identifier: String);
         fn sender_instance() -> Box<SenderServer>;
 
         fn enable_logging();
@@ -51,13 +55,13 @@ pub mod ffi {
         fn receive_buffer(
             receiver_channel: &mut ReceiverChannel,
             builder: Pin<&mut TupleBufferBuilder>,
-        ) -> Result<()>;
+        ) -> bool;
 
         fn close_receiver_channel(server: &mut ReceiverServer, channel_identifier: String);
 
         fn register_sender_channel(
             server: &SenderServer,
-            connection_identifier: u16,
+            connection_identifier: String,
             channel_identifier: String,
         ) -> Box<SenderChannel>;
 
@@ -71,24 +75,19 @@ pub mod ffi {
         ) -> SendResult;
     }
 }
+
+static RECEIVER: sync::OnceCell<Arc<receiver::NetworkService>> = sync::OnceCell::new();
+
 lazy_static! {
     static ref SENDER: Arc<sender::NetworkService> = {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .thread_name("sender")
+            .worker_threads(2)
             .enable_io()
             .enable_time()
             .build()
             .unwrap();
         sender::NetworkService::start(rt)
-    };
-    static ref RECEIVER: Arc<receiver::NetworkService> = {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("receiver")
-            .enable_io()
-            .enable_time()
-            .build()
-            .unwrap();
-        receiver::NetworkService::start(rt, 9090)
     };
 }
 pub struct ReceiverServer {
@@ -100,7 +99,7 @@ struct SenderServer {
 }
 struct SenderChannel {
     cancellation_token: CancellationToken,
-    data_queue: async_channel::Sender<TupleBuffer>,
+    data_queue: ChannelControlQueue,
 }
 
 struct ReceiverChannel {
@@ -108,11 +107,25 @@ struct ReceiverChannel {
     data_queue: Box<async_channel::Receiver<TupleBuffer>>,
 }
 
-fn receiver_instance() -> Box<ReceiverServer> {
-    Box::new(ReceiverServer {
-        handle: RECEIVER.clone(),
+fn init_receiver_server(connection_identifier: ConnectionIdentifier) {
+    RECEIVER.get_or_init(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .thread_name("receiver")
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        receiver::NetworkService::start(rt, connection_identifier)
+    });
+}
+fn receiver_instance() -> Result<Box<ReceiverServer>, Box<dyn Error>> {
+    Ok(Box::new(ReceiverServer {
+        handle: RECEIVER
+            .get()
+            .ok_or("Receiver server has not been initialized yet.")?
+            .clone(),
         cancellation_tokens: HashMap::new(),
-    })
+    }))
 }
 fn sender_instance() -> Box<SenderServer> {
     Box::new(SenderServer {
@@ -130,17 +143,23 @@ fn register_receiver_channel(
         .register_channel(channel_identifier.clone())
         .unwrap();
 
-    Box::new(ReceiverChannel {
-        cancellation_token: token,
+    let channel = Box::new(ReceiverChannel {
+        cancellation_token: token.clone(),
         data_queue: Box::new(queue),
-    })
+    });
+
+    server.cancellation_tokens.insert(channel_identifier, token);
+    channel
 }
 
 fn receive_buffer(
     receiver_channel: &mut ReceiverChannel,
     mut builder: Pin<&mut ffi::TupleBufferBuilder>,
-) -> Result<(), Box<dyn Error>> {
-    let buffer = receiver_channel.data_queue.recv_blocking()?;
+) -> bool {
+    let Ok(buffer) = receiver_channel.data_queue.recv_blocking() else {
+        return false;
+    };
+
     builder.as_mut().set_metadata(&ffi::SerializedTupleBuffer {
         sequence_number: buffer.sequence_number as usize,
         origin_id: buffer.origin_id as usize,
@@ -150,13 +169,13 @@ fn receive_buffer(
     });
 
     builder.as_mut().set_data(&buffer.data);
-    
+
     for child_buffer in buffer.child_buffers.iter() {
         assert!(!child_buffer.is_empty());
         builder.as_mut().add_child_buffer(child_buffer);
     }
 
-    Ok(())
+    true
 }
 fn close_receiver_channel(server: &mut ReceiverServer, channel_identifier: String) {
     server
@@ -167,7 +186,7 @@ fn close_receiver_channel(server: &mut ReceiverServer, channel_identifier: Strin
 }
 fn register_sender_channel(
     server: &SenderServer,
-    connection_identifier: u16,
+    connection_identifier: String,
     channel_identifier: String,
 ) -> Box<SenderChannel> {
     let (cancellation_token, data_queue) = server
@@ -192,12 +211,12 @@ fn send_channel(
         number_of_tuples: metadata.number_of_tuples as u64,
         last_chunk: metadata.last_chunk,
         data: Vec::from(data),
-        child_buffers: children
-            .iter()
-            .map(|bytes| Vec::from(*bytes))
-            .collect(),
+        child_buffers: children.iter().map(|bytes| Vec::from(*bytes)).collect(),
     };
-    match channel.data_queue.try_send(buffer) {
+    match channel
+        .data_queue
+        .try_send(ChannelControlMessage::Data(buffer))
+    {
         Ok(()) => ffi::SendResult::Ok,
         Err(TrySendError::Full(_)) => ffi::SendResult::Full,
         Err(TrySendError::Closed(_)) => ffi::SendResult::Error,
@@ -210,8 +229,27 @@ fn sender_writes_pending(channel: &SenderChannel) -> bool {
     !channel.data_queue.is_empty()
 }
 fn close_sender_channel(channel: Box<SenderChannel>) {
-    channel.cancellation_token.cancel();
-    while !(channel.data_queue.is_closed() || channel.data_queue.is_empty()) {}
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    if channel
+        .data_queue
+        .send_blocking(ChannelControlMessage::Flush(tx))
+        .is_err()
+    {
+        // already terminated
+        return;
+    }
+
+    let _ = rx.blocking_recv();
+
+    if channel
+        .data_queue
+        .send_blocking(ChannelControlMessage::Terminate)
+        .is_err()
+    {
+        // already terminated
+        return;
+    }
 }
 
 fn enable_logging() {

@@ -24,4 +24,4 @@ threadpool = "1.8.1"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_yaml = "0.9.34+deprecated"
 
-distributed = {path = "network"}
+distributed = {path = "network", features = ["json"]}
