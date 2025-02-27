@@ -1,16 +1,12 @@
-use async_channel::{RecvError, SendError, TrySendError};
-use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
+use async_channel::TrySendError;
+use distributed::protocol::{ConnectionIdentifier, TupleBuffer};
 use distributed::sender::{ChannelControlMessage, ChannelControlQueue};
 use distributed::*;
 use lazy_static::lazy_static;
 use once_cell::sync;
-use std::cell::OnceCell;
-use std::collections::HashMap;
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio_util::bytes::Bytes;
-use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 #[cxx::bridge]
@@ -25,6 +21,7 @@ pub mod ffi {
         origin_id: usize,
         chunk_number: usize,
         number_of_tuples: usize,
+        watermark: usize,
         last_chunk: bool,
     }
 
@@ -57,7 +54,7 @@ pub mod ffi {
             builder: Pin<&mut TupleBufferBuilder>,
         ) -> bool;
 
-        fn close_receiver_channel(server: &mut ReceiverServer, channel_identifier: String);
+        fn close_receiver_channel(channel: Box<ReceiverChannel>);
 
         fn register_sender_channel(
             server: &SenderServer,
@@ -92,18 +89,15 @@ lazy_static! {
 }
 pub struct ReceiverServer {
     handle: Arc<receiver::NetworkService>,
-    cancellation_tokens: HashMap<ChannelIdentifier, CancellationToken>,
 }
 struct SenderServer {
     handle: Arc<sender::NetworkService>,
 }
 struct SenderChannel {
-    cancellation_token: CancellationToken,
     data_queue: ChannelControlQueue,
 }
 
 struct ReceiverChannel {
-    cancellation_token: CancellationToken,
     data_queue: Box<async_channel::Receiver<TupleBuffer>>,
 }
 
@@ -124,7 +118,6 @@ fn receiver_instance() -> Result<Box<ReceiverServer>, Box<dyn Error>> {
             .get()
             .ok_or("Receiver server has not been initialized yet.")?
             .clone(),
-        cancellation_tokens: HashMap::new(),
     }))
 }
 fn sender_instance() -> Box<SenderServer> {
@@ -138,18 +131,14 @@ fn register_receiver_channel(
     channel_identifier: String,
 ) -> Box<ReceiverChannel> {
     info!("register_receiver_channel({})", channel_identifier);
-    let (queue, token) = server
+    let queue = server
         .handle
         .register_channel(channel_identifier.clone())
         .unwrap();
 
-    let channel = Box::new(ReceiverChannel {
-        cancellation_token: token.clone(),
+    Box::new(ReceiverChannel {
         data_queue: Box::new(queue),
-    });
-
-    server.cancellation_tokens.insert(channel_identifier, token);
-    channel
+    })
 }
 
 fn receive_buffer(
@@ -163,6 +152,7 @@ fn receive_buffer(
     builder.as_mut().set_metadata(&ffi::SerializedTupleBuffer {
         sequence_number: buffer.sequence_number as usize,
         origin_id: buffer.origin_id as usize,
+        watermark: buffer.watermark as usize,
         chunk_number: buffer.chunk_number as usize,
         number_of_tuples: buffer.number_of_tuples as usize,
         last_chunk: buffer.last_chunk,
@@ -177,26 +167,19 @@ fn receive_buffer(
 
     true
 }
-fn close_receiver_channel(server: &mut ReceiverServer, channel_identifier: String) {
-    server
-        .cancellation_tokens
-        .remove(&channel_identifier)
-        .unwrap()
-        .cancel();
+fn close_receiver_channel(channel: Box<ReceiverChannel>) {
+    channel.data_queue.close();
 }
 fn register_sender_channel(
     server: &SenderServer,
     connection_identifier: String,
     channel_identifier: String,
 ) -> Box<SenderChannel> {
-    let (cancellation_token, data_queue) = server
+    let data_queue = server
         .handle
         .register_channel(connection_identifier, channel_identifier)
         .unwrap();
-    Box::new(SenderChannel {
-        cancellation_token,
-        data_queue,
-    })
+    Box::new(SenderChannel { data_queue })
 }
 fn send_channel(
     channel: &SenderChannel,
@@ -209,6 +192,7 @@ fn send_channel(
         origin_id: metadata.origin_id as u64,
         chunk_number: metadata.chunk_number as u64,
         number_of_tuples: metadata.number_of_tuples as u64,
+        watermark: metadata.watermark as u64,
         last_chunk: metadata.last_chunk,
         data: Vec::from(data),
         child_buffers: children.iter().map(|bytes| Vec::from(*bytes)).collect(),
@@ -241,15 +225,9 @@ fn close_sender_channel(channel: Box<SenderChannel>) {
     }
 
     let _ = rx.blocking_recv();
-
-    if channel
+    let _ = channel
         .data_queue
-        .send_blocking(ChannelControlMessage::Terminate)
-        .is_err()
-    {
-        // already terminated
-        return;
-    }
+        .send_blocking(ChannelControlMessage::Terminate);
 }
 
 fn enable_logging() {

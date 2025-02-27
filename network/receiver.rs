@@ -1,23 +1,17 @@
+use crate::protocol::*;
+use futures::SinkExt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::str::from_utf8;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use crate::protocol::*;
-use crate::{protocol, sender};
-use bytes::BytesMut;
-use futures::SinkExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
+use tokio::select;
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
-use tokio::{select, stream};
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, info_span, trace, warn, Instrument, Span};
+use tracing::{error, info, info_span, warn, Instrument, Span};
 
 pub struct NetworkService {
     sender: NetworkingServiceController,
@@ -25,17 +19,12 @@ pub struct NetworkService {
 }
 
 enum NetworkingServiceControl {
-    Stop,
     RetryChannel(ChannelIdentifier, DataQueue, CancellationToken),
-    RegisterChannel(
-        ChannelIdentifier,
-        DataQueue,
-        oneshot::Sender<CancellationToken>,
-    ),
+    RegisterChannel(ChannelIdentifier, DataQueue, oneshot::Sender<()>),
 }
 type DataQueue = async_channel::Sender<TupleBuffer>;
-type NetworkingServiceController = tokio::sync::mpsc::Sender<NetworkingServiceControl>;
-type NetworkingServiceControlListener = tokio::sync::mpsc::Receiver<NetworkingServiceControl>;
+type NetworkingServiceController = async_channel::Sender<NetworkingServiceControl>;
+type NetworkingServiceControlListener = async_channel::Receiver<NetworkingServiceControl>;
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type EmitFn = Box<dyn FnMut(TupleBuffer) -> bool + Send + Sync>;
@@ -53,7 +42,7 @@ async fn channel_handler(
     queue: &mut DataQueue,
     listener: &mut TcpListener,
 ) -> core::result::Result<(), ChannelHandlerError> {
-    let (mut stream, address) = match cancellation_token
+    let (stream, address) = match cancellation_token
         .run_until_cancelled(tokio::time::timeout(
             Duration::from_secs(3),
             listener.accept(),
@@ -66,7 +55,7 @@ async fn channel_handler(
         Some(Ok(Ok((stream, address)))) => (stream, address),
     };
 
-    let (mut reader, mut writer) = protocol::data_channel_receiver(stream);
+    let (mut reader, mut writer) = data_channel_receiver(stream);
 
     let mut pending_buffer: Option<TupleBuffer> = None;
     info!("Accepted TupleBuffer channel connection from {address}");
@@ -76,7 +65,7 @@ async fn channel_handler(
             select! {
                 _ = cancellation_token.cancelled() => return Err(ChannelHandlerError::Cancelled),
                 write_queue_result = queue.send(pending_buffer) => {
-                    match(write_queue_result) {
+                    match write_queue_result {
                         Ok(_) => {
                             let Some(result) = cancellation_token.run_until_cancelled(writer.send(DataChannelResponse::AckData(sequence))).await else {
                                 return Err(ChannelHandlerError::Cancelled);
@@ -189,7 +178,7 @@ async fn control_socket_handler(
     channels: RegisteredChannels,
     control: NetworkingServiceController,
 ) -> Result<ControlChannelRequest> {
-    let (mut reader, mut writer) = protocol::control_channel_receiver(stream);
+    let (mut reader, mut writer) = control_channel_receiver(stream);
     loop {
         let message = reader.next().await.ok_or("Connection Closed")?;
         match message? {
@@ -211,14 +200,13 @@ async fn control_socket_handler(
 }
 
 async fn control_socket(
-    mut listener: NetworkingServiceControlListener,
+    listener: NetworkingServiceControlListener,
     controller: NetworkingServiceController,
     connection_identifier: ConnectionIdentifier,
 ) -> Result<()> {
-    use tokio::net::*;
     info!("Starting control socket: {}", connection_identifier);
     let listener_port = TcpListener::bind(connection_identifier.parse::<SocketAddr>()?).await?;
-    let registered_channels = Arc::new(tokio::sync::RwLock::new(HashMap::default()));
+    let registered_channels = Arc::new(RwLock::new(HashMap::default()));
 
     info!(
         "Control bound to {}",
@@ -228,7 +216,7 @@ async fn control_socket(
     );
 
     loop {
-        tokio::select! {
+        select! {
             connect = listener_port.accept() => {
                 let (stream, addr) = connect?;
                 tokio::spawn(
@@ -241,29 +229,27 @@ async fn control_socket(
                         }.instrument(info_span!("connection", addr = %addr))
                     });
             },
-            control_message = listener.recv() => {
-               let message  = control_message.ok_or("Socket Closed")?;
-               match message{
-                    NetworkingServiceControl::Stop => {
-                        registered_channels.write().await.iter().for_each(|(_, (_, token))|{
-                           token.cancel();
-                        });
-                        return Ok(())
-                    },
-                    NetworkingServiceControl::RegisterChannel(ident,emit_fn, response) => {
-                        let token = CancellationToken::new();
-                        {
-                            let mut locked = registered_channels.write().await;
-                            locked.retain(|_, (_, token)| !token.is_cancelled());
-                            locked.insert(ident, (emit_fn, token.clone()));
-                        }
-                        match response.send(token.clone()) {
-                            Ok(_) => {},
-                            Err(_) => {token.cancel();}
-                        }
+            control_message = listener.recv() => match control_message {
+                Err(_) => {
+                    registered_channels.write().await.iter().for_each(|(_, (_, token))|{
+                       token.cancel();
+                    });
+                    return Ok(())
+                },
+                Ok(NetworkingServiceControl::RegisterChannel(ident,emit_fn, response)) => {
+                    let token = CancellationToken::new();
+                    {
+                        let mut locked = registered_channels.write().await;
+                        locked.retain(|_, (_, token)| !token.is_cancelled());
+                        locked.insert(ident, (emit_fn, token.clone()));
                     }
-                    NetworkingServiceControl::RetryChannel(ident, emit_fn, token) => {registered_channels.write().await.insert(ident, (emit_fn, token));}
-                };
+
+                    match response.send(()) {
+                        Ok(_) => {},
+                        Err(_) => {token.cancel();}
+                    }
+                }
+                Ok(NetworkingServiceControl::RetryChannel(ident, emit_fn, token)) => {registered_channels.write().await.insert(ident, (emit_fn, token));}
             }
         }
     }
@@ -273,7 +259,7 @@ impl NetworkService {
         runtime: Runtime,
         connection_identifier: ConnectionIdentifier,
     ) -> Arc<NetworkService> {
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = async_channel::bounded(10);
         let service = Arc::new(NetworkService {
             sender: tx.clone(),
             runtime: Mutex::new(Some(runtime)),
@@ -309,42 +295,32 @@ impl NetworkService {
     pub fn register_channel(
         self: &Arc<NetworkService>,
         channel: ChannelIdentifier,
-    ) -> Result<(async_channel::Receiver<TupleBuffer>, CancellationToken)> {
+    ) -> Result<async_channel::Receiver<TupleBuffer>> {
         let (data_queue_sender, data_queue_receiver) = async_channel::bounded(10);
         let (tx, rx) = oneshot::channel();
-        self.runtime
-            .lock()
-            .expect("BUG: No one should panic while holding this lock")
-            .as_ref()
-            .ok_or("Networking Service was stopped")?
-            .block_on(async move {
-                if let Err(e) = self
-                    .sender
-                    .send(NetworkingServiceControl::RegisterChannel(
-                        channel,
-                        data_queue_sender,
-                        tx,
-                    ))
-                    .await
-                {
-                    return Err("Networking Service was stopped".into());
-                }
-
-                match rx.await {
-                    Ok(cancellation_token) => Ok((data_queue_receiver, cancellation_token)),
-                    Err(_) => Err("Networking Service was stopped".into()),
-                }
-            })
+        let Ok(_) = self
+            .sender
+            .send_blocking(NetworkingServiceControl::RegisterChannel(
+                channel,
+                data_queue_sender,
+                tx,
+            ))
+        else {
+            return Err("Networking Service was stopped".into());
+        };
+        rx.blocking_recv()
+            .map_err(|_| "Networking Service was stopped")?;
+        Ok(data_queue_receiver)
     }
 
     pub fn shutdown(self: Arc<NetworkService>) -> Result<()> {
+        self.sender.close();
         let runtime = self
             .runtime
             .lock()
             .expect("BUG: No one should panic while holding this lock")
             .take()
             .ok_or("Networking Service was stopped")?;
-        runtime.block_on(self.sender.send(NetworkingServiceControl::Stop))?;
         runtime.shutdown_timeout(Duration::from_secs(1));
         Ok(())
     }

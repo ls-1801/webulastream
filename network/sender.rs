@@ -1,23 +1,20 @@
-use crate::protocol;
 use crate::protocol::*;
 use futures::SinkExt;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpSocket;
 use tokio::runtime::Runtime;
-use tokio::select;
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, info_span, warn, Instrument};
-use tracing_subscriber::fmt::format;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub struct NetworkService {
-    runtime: Mutex<Option<tokio::runtime::Runtime>>,
+    runtime: Mutex<Option<Runtime>>,
     controller: NetworkingServiceController,
     cancellation_token: CancellationToken,
 }
@@ -26,14 +23,11 @@ enum NetworkingServiceControlMessage {
     RegisterChannel(
         ConnectionIdentifier,
         ChannelIdentifier,
-        oneshot::Sender<(CancellationToken, ChannelControlQueue)>,
+        oneshot::Sender<ChannelControlQueue>,
     ),
 }
 enum NetworkingConnectionControlMessage {
-    RegisterChannel(
-        ChannelIdentifier,
-        oneshot::Sender<(CancellationToken, ChannelControlQueue)>,
-    ),
+    RegisterChannel(ChannelIdentifier, oneshot::Sender<ChannelControlQueue>),
     RetryChannel(
         ChannelIdentifier,
         CancellationToken,
@@ -42,12 +36,11 @@ enum NetworkingConnectionControlMessage {
 }
 pub type ChannelControlMessage = channel_handler::ChannelControlMessage;
 pub type ChannelControlQueue = channel_handler::ChannelControlQueue;
-type NetworkingServiceController = tokio::sync::mpsc::Sender<NetworkingServiceControlMessage>;
-type NetworkingServiceControlListener =
-    tokio::sync::mpsc::Receiver<NetworkingServiceControlMessage>;
-type NetworkingConnectionController = tokio::sync::mpsc::Sender<NetworkingConnectionControlMessage>;
+type NetworkingServiceController = async_channel::Sender<NetworkingServiceControlMessage>;
+type NetworkingServiceControlListener = async_channel::Receiver<NetworkingServiceControlMessage>;
+type NetworkingConnectionController = async_channel::Sender<NetworkingConnectionControlMessage>;
 type NetworkingConnectionControlListener =
-    tokio::sync::mpsc::Receiver<NetworkingConnectionControlMessage>;
+    async_channel::Receiver<NetworkingConnectionControlMessage>;
 
 enum ChannelHandlerResult {
     Cancelled,
@@ -68,7 +61,7 @@ mod channel_handler {
     use tokio::sync::oneshot;
     use tokio_stream::StreamExt;
     use tokio_util::sync::CancellationToken;
-    use tracing::info;
+    use tracing::{info, trace, warn};
 
     const MAX_PENDING_ACKS: usize = 64;
 
@@ -140,7 +133,7 @@ mod channel_handler {
                 }
                 DataChannelResponse::NAckData(seq) => {
                     if let Some(write) = self.wait_for_ack.remove(&seq) {
-                        info!("NAck for {seq}");
+                        warn!("NAck for {seq}");
                         self.pending_writes.push_back(write);
                     } else {
                         return Err(ChannelHandlerError::Protocol(
@@ -154,7 +147,7 @@ mod channel_handler {
                             format!("Protocol Error. Unknown Seq {seq}").into(),
                         ));
                     };
-                    info!("Ack for {seq}");
+                    trace!("Ack for {seq}");
                 }
             }
 
@@ -170,14 +163,14 @@ mod channel_handler {
                 return Ok(());
             }
 
-            if (writer
+            if writer
                 .feed(DataChannelRequest::Data(
                     pending_writes
                         .front()
-                        .expect("BUG: check value eralier")
+                        .expect("BUG: check value earlier")
                         .clone(),
                 ))
-                .await)
+                .await
                 .is_ok()
             {
                 wait_for_ack.insert(
@@ -252,7 +245,11 @@ async fn channel_handler(
 ) -> ChannelHandlerResult {
     let socket = match TcpSocket::new_v4() {
         Ok(socket) => socket,
-        Err(e) => return ChannelHandlerResult::ConnectionLost("Could not create socket".into()),
+        Err(e) => {
+            return ChannelHandlerResult::ConnectionLost(
+                format!("Could not create socket {e:?}").into(),
+            )
+        }
     };
 
     let connection = match cancellation_token
@@ -273,10 +270,10 @@ async fn channel_handler(
         }
         Err(channel_handler::ChannelHandlerError::Cancelled) => ChannelHandlerResult::Cancelled,
         Err(channel_handler::ChannelHandlerError::ConnectionLost(e)) => {
-            ChannelHandlerResult::ConnectionLost(e.into())
+            ChannelHandlerResult::ConnectionLost(e)
         }
         Err(channel_handler::ChannelHandlerError::Protocol(e)) => {
-            ChannelHandlerResult::ConnectionLost(e.into())
+            ChannelHandlerResult::ConnectionLost(e)
         }
     }
 }
@@ -292,7 +289,6 @@ enum EstablishChannelResult {
         channel_handler::ChannelControlQueueListener,
         Error,
     ),
-    BadProtocol,
     Cancelled,
 }
 
@@ -359,10 +355,9 @@ async fn establish_channel(
                 )
                 .await
                 {
-                    ChannelHandlerResult::Cancelled => {
-                        return;
-                    }
-                    ChannelHandlerResult::ConnectionLost(_) => {
+                    ChannelHandlerResult::Cancelled => {}
+                    ChannelHandlerResult::ConnectionLost(e) => {
+                        warn!("Connection Lost: {e:?}");
                         match &channel_cancellation_token
                             .run_until_cancelled(controller.send(
                                 NetworkingConnectionControlMessage::RetryChannel(
@@ -373,9 +368,7 @@ async fn establish_channel(
                             ))
                             .await
                         {
-                            None => {
-                                return;
-                            }
+                            None => {}
                             Some(Ok(())) => {
                                 info!("Channel connection lost.Reopening channel");
                             }
@@ -390,7 +383,7 @@ async fn establish_channel(
         }
         .instrument(info_span!("channel handler", channel = %channel, port = %port)),
     );
-    return EstablishChannelResult::Ok(channel_cancellation_token);
+    EstablishChannelResult::Ok(channel_cancellation_token)
 }
 
 async fn accept_channel_requests(
@@ -413,10 +406,10 @@ async fn accept_channel_requests(
             .run_until_cancelled(tokio::time::timeout(timeout, listener.recv()))
             .await
         {
-            None => return None,           // cancelled
-            Some(Err(_)) => break,         // timeout
-            Some(Ok(None)) => return None, // queue closed
-            Some(Ok(Some(request))) => {
+            None => return None,             // cancelled
+            Some(Err(_)) => break,           // timeout
+            Some(Ok(Err(_))) => return None, // queue closed
+            Some(Ok(Ok(request))) => {
                 requests.push(request);
             }
         }
@@ -427,7 +420,7 @@ async fn accept_channel_requests(
             NetworkingConnectionControlMessage::RegisterChannel(channel, response) => {
                 let (sender, queue) = async_channel::bounded(100);
                 let channel_cancellation = CancellationToken::new();
-                if let Err(_) = response.send((channel_cancellation.clone(), sender)) {
+                if response.send(sender).is_err() {
                     warn!("Channel registration was canceled");
                     continue;
                 }
@@ -462,8 +455,8 @@ async fn connection_handler(
     let on_cancel = |active_channel: HashMap<ChannelIdentifier, CancellationToken>| {
         active_channel
             .into_iter()
-            .for_each(|(channel, token)| token.cancel());
-        return Ok(());
+            .for_each(|(_, token)| token.cancel());
+        Ok(())
     };
 
     let mut retry = 0;
@@ -482,7 +475,7 @@ async fn connection_handler(
         }
 
         let socket = TcpSocket::new_v4()?;
-        let mut connection = match connection_cancellation_token
+        let connection = match connection_cancellation_token
             .run_until_cancelled(socket.connect(connection_identifier.parse()?))
             .await
         {
@@ -491,12 +484,12 @@ async fn connection_handler(
             Some(Err(e)) => {
                 retry += 1;
                 warn!("Could not establish connection {}.Retry in {} s", e, retry);
-                tokio::time::sleep(std::time::Duration::from_secs(retry)).await;
+                tokio::time::sleep(Duration::from_secs(retry)).await;
                 continue;
             }
         };
 
-        let (mut reader, mut writer) = protocol::control_channel_sender(connection);
+        let (mut reader, mut writer) = control_channel_sender(connection);
 
         retry = 0;
 
@@ -550,10 +543,8 @@ async fn connection_handler(
                             queue,
                         ));
                     }
-                    Some(EstablishChannelResult::BadProtocol) => {
-                        return Err("Bad Protocol".into());
-                    }
                     Some(EstablishChannelResult::BadConnection(channel, queue, e)) => {
+                        warn!("Could not establish channel: {e:?}");
                         connection_failure = true;
                         updated_pending_channels.push((
                             channel,
@@ -573,9 +564,9 @@ async fn connection_handler(
 async fn create_connection(
     connection: &ConnectionIdentifier,
 ) -> Result<(CancellationToken, NetworkingConnectionController)> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<NetworkingConnectionControlMessage>(1024);
+    let (tx, rx) = async_channel::bounded::<NetworkingConnectionControlMessage>(1024);
     let control = tx.clone();
-    let token = tokio_util::sync::CancellationToken::new();
+    let token = CancellationToken::new();
     tokio::spawn(
         {
             let token = token.clone();
@@ -587,7 +578,7 @@ async fn create_connection(
                 );
             }
         }
-        .instrument(tracing::info_span!(
+        .instrument(info_span!(
             "connection_handler",
             connection = connection.clone()
         )),
@@ -597,7 +588,7 @@ async fn create_connection(
 
 async fn network_sender_dispatcher(
     cancellation_token: CancellationToken,
-    mut control: NetworkingServiceControlListener,
+    control: NetworkingServiceControlListener,
 ) -> Result<()> {
     let mut connections: HashMap<
         ConnectionIdentifier,
@@ -610,18 +601,14 @@ async fn network_sender_dispatcher(
         active_channel
             .into_iter()
             .for_each(|(_, (token, _))| token.cancel());
-        return Ok(());
+        Ok(())
     };
 
     loop {
         match cancellation_token.run_until_cancelled(control.recv()).await {
             None => return on_cancel(connections),
-            Some(None) => return Err("Queue was closed".into()),
-            Some(Some(NetworkingServiceControlMessage::RegisterChannel(
-                connection,
-                channel,
-                tx,
-            ))) => {
+            Some(Err(_)) => return Err("Queue was closed".into()),
+            Some(Ok(NetworkingServiceControlMessage::RegisterChannel(connection, channel, tx))) => {
                 if !connections.contains_key(&connection) {
                     match cancellation_token
                         .run_until_cancelled(create_connection(&connection))
@@ -661,7 +648,7 @@ async fn network_sender_dispatcher(
 }
 impl NetworkService {
     pub fn start(runtime: Runtime) -> Arc<NetworkService> {
-        let (controller, listener) = tokio::sync::mpsc::channel(5);
+        let (controller, listener) = async_channel::bounded(5);
         let cancellation_token = CancellationToken::new();
         runtime.spawn({
             let token = cancellation_token.clone();
@@ -685,27 +672,19 @@ impl NetworkService {
         self: &Arc<NetworkService>,
         connection: ConnectionIdentifier,
         channel: ChannelIdentifier,
-    ) -> Result<(CancellationToken, channel_handler::ChannelControlQueue)> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.runtime
-            .lock()
-            .expect("BUG: Nothing should panic while holding the lock")
-            .as_ref()
-            .ok_or("Networking Service was stopped")?
-            .block_on(async move {
-                let Ok(()) = self
-                    .controller
-                    .send(NetworkingServiceControlMessage::RegisterChannel(
-                        connection, channel, tx,
-                    ))
-                    .await
-                else {
-                    return Err("Could not send request".into());
-                };
+    ) -> Result<channel_handler::ChannelControlQueue> {
+        let (tx, rx) = oneshot::channel();
+        let Ok(_) =
+            self.controller
+                .send_blocking(NetworkingServiceControlMessage::RegisterChannel(
+                    connection, channel, tx,
+                ))
+        else {
+            return Err("Network Service Closed".into());
+        };
 
-                rx.await
-                    .map_err(|e| format!("Could not receive: {e}").into())
-            })
+        rx.blocking_recv()
+            .map_err(|_| "Network Service Closed".into())
     }
 
     pub fn shutdown(self: Arc<NetworkService>) -> Result<()> {

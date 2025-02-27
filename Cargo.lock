@@ -202,6 +202,7 @@ dependencies = [
  "bytes",
  "flexbuffers",
  "futures",
+ "log",
  "serde",
  "serde_json",
  "tokio",

@@ -1,9 +1,8 @@
-use bytes::BytesMut;
+use distributed::protocol::TupleBuffer;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
-use distributed::protocol::TupleBuffer;
 use threadpool::ThreadPool;
 use tracing::{error, info};
 
@@ -43,10 +42,10 @@ pub struct SourceNode {
 }
 
 impl SourceNode {
-    fn start(&self, queue: Arc<Queue>) {
+    fn start(&self, queue: Arc<Queue>, query_id: usize) {
         let successor = self.successor.clone();
         let emit_fn = Box::new(move |buffer| {
-            queue.push(Task::Compute(buffer, successor.clone()));
+            queue.push(Task::Compute(query_id, buffer, successor.clone()));
         }) as EmitFn;
         self.implementation.start(emit_fn);
     }
@@ -80,7 +79,7 @@ pub trait ExecutablePipeline {
 }
 
 enum Task {
-    Compute(TupleBuffer, Arc<Node>),
+    Compute(usize, TupleBuffer, Arc<Node>),
 }
 
 pub struct Query {
@@ -114,6 +113,7 @@ impl Default for QueryEngine {
 }
 
 struct PEC<'a> {
+    query_id: usize,
     queue: &'a Queue,
     successor: &'a Option<Arc<Node>>,
 }
@@ -122,7 +122,7 @@ impl PipelineContext for PEC<'_> {
     fn emit(&mut self, data: TupleBuffer) {
         if let Some(successor) = self.successor {
             self.queue
-                .push(Task::Compute(data, successor.clone()));
+                .push(Task::Compute(self.query_id, data, successor.clone()));
         }
     }
 }
@@ -137,12 +137,17 @@ impl QueryEngine {
             move || loop {
                 if let Some(task) = engine.queue.pop() {
                     match task {
-                        Task::Compute(input, node) => {
+                        Task::Compute(query_id, input, node) => {
                             let mut pec = PEC {
+                                query_id,
                                 queue: &engine.queue,
                                 successor: &node.successor,
                             };
-                            node.pipeline.execute(&input, &mut pec);
+                            let span = tracing::info_span!("Task", query_id = query_id);
+                            {
+                                let _enter = span.enter();
+                                node.pipeline.execute(&input, &mut pec);
+                            }
                         }
                     }
                 }
@@ -163,10 +168,10 @@ impl QueryEngine {
         }
     }
     pub fn start_query(self: &Arc<Self>, query: Query) -> usize {
-        for source in &query.sources {
-            source.lock().unwrap().start(self.queue.clone());
-        }
         let id = self.id_counter.fetch_add(1, Relaxed);
+        for source in &query.sources {
+            source.lock().unwrap().start(self.queue.clone(), id);
+        }
         self.queries.lock().unwrap().insert(id, query);
         info!("Started Query with id {id}");
         id

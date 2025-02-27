@@ -5,23 +5,22 @@ use crate::config::Command;
 use crate::engine::{
     EmitFn, ExecutablePipeline, Node, PipelineContext, Query, QueryEngine, SourceImpl, SourceNode,
 };
-use async_channel::{RecvError, TryRecvError, TrySendError};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use async_channel::TrySendError;
+use bytes::{Buf, BufMut, BytesMut};
 use clap::{Parser, Subcommand};
 use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
+use distributed::sender::ChannelControlMessage;
 use distributed::{receiver, sender};
 use log::error;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::prelude::*;
 use std::io::Cursor;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
-use std::sync::Arc;
-use std::thread::sleep;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::{sync, thread};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 // mod inter_node {
 pub type Result<T> = std::result::Result<T, Error>;
@@ -39,7 +38,9 @@ struct CLIArgs {
 #[derive(Subcommand)]
 enum Commands {}
 
-struct PrintSink;
+struct PrintSink {
+    sequence_tracker: Mutex<MissingSequenceTracker>,
+}
 
 fn verify_tuple_buffer(received: &TupleBuffer) -> bool {
     let counter = (received.sequence_number - 1) as usize;
@@ -86,21 +87,132 @@ fn verify_tuple_buffer(received: &TupleBuffer) -> bool {
     true
 }
 
+/// A data structure that tracks seen positive integers and finds the lowest unseen number.
+#[derive(Default)]
+pub struct MissingSequenceTracker {
+    seen: HashSet<u64>,
+    highest_seen: u64,
+    lowest_removed: u64,
+}
+
+impl MissingSequenceTracker {
+    /// Creates a new empty tracker.
+    pub fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            highest_seen: 0,
+            lowest_removed: 0,
+        }
+    }
+
+    /// Adds a positive number to the tracker.
+    /// Panics if the number is zero or already seen.
+    pub fn add(&mut self, num: u64) {
+        // Assert that the number is valid (positive)
+        assert!(num > 0, "Only positive numbers are allowed");
+        assert!(
+            !self.seen.contains(&num),
+            "Number {} has already been seen",
+            num
+        );
+
+        if num > self.highest_seen {
+            self.highest_seen = num;
+        }
+
+        self.seen.insert(num);
+
+        if self.seen.len() > 1000 {
+            let lowest = self.query();
+            self.seen.retain(|&x| x > lowest);
+            self.lowest_removed = lowest - 1;
+        }
+    }
+
+    /// Returns the lowest positive integer that hasn't been seen yet.
+    pub fn query(&self) -> u64 {
+        if self.seen.len() as u64 == self.highest_seen - self.lowest_removed {
+            return self.highest_seen + 1;
+        }
+
+        for i in 1..=self.highest_seen {
+            if !self.seen.contains(&(i + self.lowest_removed)) {
+                return i + self.lowest_removed;
+            }
+        }
+
+        unreachable!()
+    }
+}
+
+#[test]
+fn testSequenceTrackerMissingOne() {
+    let mut tracker = MissingSequenceTracker::default();
+    for i in 1..1004 {
+        if i == 100 || i == 193 || i == 210 {
+            continue;
+        }
+        tracker.add(i);
+    }
+
+    assert_eq!(tracker.query(), 100);
+    tracker.add(100);
+    tracker.add(1004);
+    assert_eq!(tracker.query(), 193);
+    tracker.add(193);
+    assert_eq!(tracker.query(), 210);
+    tracker.add(1005);
+}
+#[test]
+fn testSequenceTrackerMissing() {
+    let tracker = MissingSequenceTracker::default();
+
+    assert_eq!(tracker.query(), 1);
+}
+#[test]
+fn testSequenceTrackerOOMissing() {
+    let mut tracker = MissingSequenceTracker::default();
+    tracker.add(1);
+    tracker.add(4);
+    tracker.add(2);
+
+    assert_eq!(tracker.query(), 3);
+}
+#[test]
+fn testSequenceTrackerOO() {
+    let mut tracker = MissingSequenceTracker::default();
+    tracker.add(1);
+    tracker.add(3);
+    tracker.add(2);
+
+    assert_eq!(tracker.query(), 4);
+}
+#[test]
+fn testSequenceTracker() {
+    let mut tracker = MissingSequenceTracker::default();
+    tracker.add(1);
+    tracker.add(2);
+    tracker.add(3);
+
+    assert_eq!(tracker.query(), 4);
+}
+
 impl ExecutablePipeline for PrintSink {
     fn execute(&self, data: &TupleBuffer, _context: &mut dyn PipelineContext) {
-        info!(
-            "Buffer {} is {}",
-            data.sequence_number,
-            if verify_tuple_buffer(data) {
-                "OK"
-            } else {
-                "NOT OK"
-            }
-        );
+        if !verify_tuple_buffer(data) {
+            error!("Invalid data received");
+        }
+        self.sequence_tracker
+            .lock()
+            .unwrap()
+            .add(data.sequence_number);
     }
 
     fn stop(&self) {
-        //NOP
+        info!(
+            "Sink stopped. Last Sequence: {}",
+            self.sequence_tracker.lock().unwrap().query() - 1
+        );
     }
 }
 
@@ -108,7 +220,7 @@ struct NetworkSink {
     service: Arc<sender::NetworkService>,
     connection: ConnectionIdentifier,
     channel: ChannelIdentifier,
-    queue: sync::RwLock<Option<(CancellationToken, sender::ChannelControlQueue)>>,
+    queue: sync::RwLock<Option<sender::ChannelControlQueue>>,
     buffer: std::sync::RwLock<VecDeque<TupleBuffer>>,
 }
 
@@ -155,7 +267,6 @@ impl ExecutablePipeline for NetworkSink {
                         .unwrap()
                         .as_ref()
                         .unwrap()
-                        .1
                         .try_send(sender::ChannelControlMessage::Data(front))
                     {
                         Err(TrySendError::Full(sender::ChannelControlMessage::Data(data))) => {
@@ -177,7 +288,6 @@ impl ExecutablePipeline for NetworkSink {
             .unwrap()
             .as_ref()
             .unwrap()
-            .1
             .try_send(sender::ChannelControlMessage::Data(data.clone()))
         {
             Err(TrySendError::Full(sender::ChannelControlMessage::Data(data))) => {
@@ -191,8 +301,30 @@ impl ExecutablePipeline for NetworkSink {
     }
 
     fn stop(&self) {
-        info!("Cancelling Sink");
-        self.queue.write().unwrap().take().unwrap().0.cancel();
+        info!("Closing Network Sink");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let queue = self.queue.write().unwrap().take().unwrap();
+        if queue
+            .send_blocking(ChannelControlMessage::Flush(tx))
+            .is_err()
+        {
+            warn!("Network sink was already closed");
+            return;
+        }
+
+        if rx.blocking_recv().is_err() {
+            warn!("Network sink was already closed");
+            return;
+        }
+
+        if queue
+            .send_blocking(ChannelControlMessage::Terminate)
+            .is_err()
+        {
+            warn!("Network sink was already closed");
+            return;
+        }
+        queue.close();
     }
 }
 
@@ -200,8 +332,7 @@ struct NetworkSource {
     channel: ChannelIdentifier,
     service: Arc<receiver::NetworkService>,
     ingestion_rate: Option<Duration>,
-    token: std::sync::Mutex<Option<CancellationToken>>,
-    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    thread: std::sync::Mutex<Option<Thread<()>>>,
 }
 
 impl NetworkSource {
@@ -214,7 +345,6 @@ impl NetworkSource {
             channel,
             service,
             ingestion_rate,
-            token: sync::Mutex::default(),
             thread: sync::Mutex::default(),
         }
     }
@@ -223,29 +353,32 @@ impl NetworkSource {
 impl engine::SourceImpl for NetworkSource {
     fn start(&self, emit: engine::EmitFn) {
         let ingestion_rate = self.ingestion_rate.unwrap_or(Duration::from_millis(0));
-        let (queue, token) = self.service.register_channel(self.channel.clone()).unwrap();
-        self.token.lock().unwrap().replace(token);
+        let queue = self.service.register_channel(self.channel.clone()).unwrap();
 
         self.thread
             .lock()
             .unwrap()
-            .replace(thread::spawn(move || loop {
-                match queue.recv_blocking() {
-                    Ok(d) => {
-                        emit(d);
-                    }
-                    Err(e) => {
-                        error!("Source stopped {e}");
-                        return;
-                    }
-                };
-                sleep(ingestion_rate);
+            .replace(Thread::spawn(move |stopped: &AtomicBool| {
+                while !stopped.load(Ordering::Relaxed) {
+                    match queue.recv_blocking() {
+                        Ok(d) => {
+                            emit(d);
+                        }
+                        Err(_) => {
+                            info!("External source stop");
+                            return;
+                        }
+                    };
+                    thread::sleep(ingestion_rate);
+                }
+                info!("Internal source stop");
+                queue.close();
             }));
     }
 
     fn stop(&self) {
         info!("Cancelling Source");
-        self.token.lock().unwrap().take().unwrap().cancel();
+        let _ = self.thread.lock().unwrap().take();
     }
 }
 
@@ -303,7 +436,7 @@ impl SourceImpl for GeneratorSource {
             let interval = self.interval;
             move |stopped| {
                 let mut counter = 0_usize;
-                while !stopped.load(Acquire) {
+                while !stopped.load(Ordering::Relaxed) {
                     let buffer = vec![0u8; 16];
                     let mut cursor = Cursor::new(buffer);
                     while cursor.has_remaining() {
@@ -324,15 +457,16 @@ impl SourceImpl for GeneratorSource {
                     emit(TupleBuffer {
                         sequence_number: counter as u64,
                         origin_id: 1,
+                        watermark: 2,
                         chunk_number: 1,
                         number_of_tuples: 1,
                         last_chunk: true,
                         data: cursor.into_inner(),
                         child_buffers,
                     });
-                    sleep(interval);
+                    thread::sleep(interval);
                 }
-                info!("Generator stopped");
+                info!("Source stopped. Last Sequence: {counter}");
             }
         }));
     }
@@ -382,7 +516,12 @@ fn sink(
     receiver: Arc<receiver::NetworkService>,
 ) -> usize {
     engine.start_query(Query::new(vec![SourceNode::new(
-        Node::new(None, Arc::new(PrintSink {})),
+        Node::new(
+            None,
+            Arc::new(PrintSink {
+                sequence_tracker: Default::default(),
+            }),
+        ),
         Box::new(NetworkSource::new(
             channel,
             ingestion_rate_in_milliseconds.map(|millis| Duration::from_millis(millis)),
@@ -485,7 +624,7 @@ fn main() {
                 engine.stop_query(id);
             }
             Command::Wait { millis } => {
-                sleep(Duration::from_millis(millis as u64));
+                thread::sleep(Duration::from_millis(millis as u64));
             }
         };
     }

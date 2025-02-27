@@ -26,3 +26,4 @@ flexbuffers = "25.2.10"
 tokio-stream = "0.1.17"
 tokio-serde = { version = "0.9", features = ["cbor", "serde_cbor"] }
 futures = "0.3.31"
+log = "0.4.25"
