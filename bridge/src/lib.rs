@@ -64,6 +64,8 @@ pub mod ffi {
 
         fn close_sender_channel(channel: Box<SenderChannel>);
         fn sender_writes_pending(channel: &SenderChannel) -> bool;
+
+        fn flush_channel(channel: &SenderChannel);
         fn send_channel(
             channel: &SenderChannel,
             metadata: SerializedTupleBuffer,
@@ -211,6 +213,18 @@ fn sender_writes_pending(channel: &SenderChannel) -> bool {
         return false;
     }
     !channel.data_queue.is_empty()
+}
+
+fn flush_channel(channel: &SenderChannel) {
+    let (tx, _) = tokio::sync::oneshot::channel();
+    if channel
+        .data_queue
+        .send_blocking(ChannelControlMessage::Flush(tx))
+        .is_err()
+    {
+        // already terminated
+        return;
+    }
 }
 fn close_sender_channel(channel: Box<SenderChannel>) {
     let (tx, rx) = tokio::sync::oneshot::channel();

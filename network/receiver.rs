@@ -86,7 +86,7 @@ async fn channel_handler(
         select! {
             _ = cancellation_token.cancelled() => return Err(ChannelHandlerError::Cancelled),
             request = reader.next() => pending_buffer = {
-                match request.ok_or(ChannelHandlerError::ClosedByOtherSide)?.map_err(|e| ChannelHandlerError::Network(e.into()))? {
+                match request.ok_or(ChannelHandlerError::Network("Connection Lost".into()))?.map_err(|e| ChannelHandlerError::Network(e.into()))? {
                     DataChannelRequest::Data(buffer) => Some(buffer),
                     DataChannelRequest::Close => {
                         queue.close();
@@ -147,6 +147,7 @@ async fn create_channel_handler(
 
             match channel_handler_error {
                 ChannelHandlerError::Cancelled => {
+                    info!("Data Channel Stopped");
                     return;
                 }
                 ChannelHandlerError::Network(e) => {
@@ -155,8 +156,12 @@ async fn create_channel_handler(
                 ChannelHandlerError::Timeout => {
                     warn!("Data Channel Stopped due to connection timeout");
                 }
-                ChannelHandlerError::ClosedByOtherSide => {}
+                ChannelHandlerError::ClosedByOtherSide => {
+                    info!("Data Channel Stopped");
+                    queue.close();
+                }
             }
+            info!("reopening channel");
             // Reopen the channel
             control
                 .send(NetworkingServiceControl::RetryChannel(
@@ -179,10 +184,19 @@ async fn control_socket_handler(
     control: NetworkingServiceController,
 ) -> Result<ControlChannelRequest> {
     let (mut reader, mut writer) = control_channel_receiver(stream);
+    let mut active_connection_channels = vec![];
     loop {
-        let message = reader.next().await.ok_or("Connection Closed")?;
-        match message? {
+        let Some(Ok(message)) = reader.next().await else {
+            warn!("Connection was closed. Cancelling {} channel(s)", active_connection_channels.len());
+            active_connection_channels
+                .into_iter()
+                .for_each(|t: CancellationToken| t.cancel());
+            return Err("Connection Closed".into());
+        };
+
+        match message {
             ControlChannelRequest::ChannelRequest(channel) => {
+                active_connection_channels.retain(|t: &CancellationToken| !t.is_cancelled());
                 let Some((emit, token)) = channels.write().await.remove(&channel) else {
                     writer
                         .send(ControlChannelResponse::DenyChannelResponse)
@@ -190,10 +204,12 @@ async fn control_socket_handler(
                     continue;
                 };
 
-                let port = create_channel_handler(channel, emit, token, control.clone()).await?;
+                let port =
+                    create_channel_handler(channel, emit, token.clone(), control.clone()).await?;
                 writer
                     .send(ControlChannelResponse::OkChannelResponse(port))
                     .await?;
+                active_connection_channels.push(token);
             }
         }
     }
