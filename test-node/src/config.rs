@@ -1,4 +1,4 @@
-use distributed::protocol::{ChannelIdentifier, ConnectionIdentifier};
+use nes_network::protocol::{ChannelIdentifier, ConnectionIdentifier};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]

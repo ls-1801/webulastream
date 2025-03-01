@@ -1,26 +1,15 @@
 [package]
 name = "distributed_bridge"
 version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["staticlib"]
-name = "distributed_bridge"
-path = "src/lib.rs"
+edition = "2024"
 
 [dependencies]
+# Generate C++ bindings
 cxx = "1.0.140"
-distributed = { path = "../network" }
-lazy_static = "1.5.0"
-tokio = { version = "1.40.0", features = ["macros", "rt-multi-thread", "sync", "net", "io-util", "time"] }
-tokio-util = "0.7.13"
-
+# Global Sender/Receiver Server
 once_cell = "1.20"
 
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "sync", "time"] }
 async-channel = "2.3.1"
-log = "0.4.25"
-
-[build-dependencies]
-cxx-build = "1.0"
+nes_network = { path = "../network" }
+spdlog_bridge = {path = "../spdlog-bridge"}

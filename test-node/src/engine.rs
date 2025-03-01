@@ -1,4 +1,4 @@
-use distributed::protocol::TupleBuffer;
+use nes_network::protocol::TupleBuffer;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;

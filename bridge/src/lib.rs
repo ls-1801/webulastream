@@ -1,13 +1,11 @@
 use async_channel::TrySendError;
-use distributed::protocol::{ConnectionIdentifier, TupleBuffer};
-use distributed::sender::{ChannelControlMessage, ChannelControlQueue};
-use distributed::*;
-use lazy_static::lazy_static;
+use nes_network::protocol::{ConnectionIdentifier, TupleBuffer};
+use nes_network::sender::{ChannelControlMessage, ChannelControlQueue};
+use nes_network::*;
 use once_cell::sync;
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::info;
 
 #[cxx::bridge]
 pub mod ffi {
@@ -41,9 +39,8 @@ pub mod ffi {
 
         fn receiver_instance() -> Result<Box<ReceiverServer>>;
         fn init_receiver_server(connection_identifier: String);
-        fn sender_instance() -> Box<SenderServer>;
-
-        fn enable_logging();
+        fn init_sender_server();
+        fn sender_instance() -> Result<Box<SenderServer>>;
 
         fn register_receiver_channel(
             server: &mut ReceiverServer,
@@ -76,19 +73,8 @@ pub mod ffi {
 }
 
 static RECEIVER: sync::OnceCell<Arc<receiver::NetworkService>> = sync::OnceCell::new();
+static SENDER: sync::OnceCell<Arc<sender::NetworkService>> = sync::OnceCell::new();
 
-lazy_static! {
-    static ref SENDER: Arc<sender::NetworkService> = {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("sender")
-            .worker_threads(2)
-            .enable_io()
-            .enable_time()
-            .build()
-            .unwrap();
-        sender::NetworkService::start(rt)
-    };
-}
 pub struct ReceiverServer {
     handle: Arc<receiver::NetworkService>,
 }
@@ -103,6 +89,17 @@ struct ReceiverChannel {
     data_queue: Box<async_channel::Receiver<TupleBuffer>>,
 }
 
+fn init_sender_server() {
+    SENDER.get_or_init(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .thread_name("receiver")
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        sender::NetworkService::start(rt)
+    });
+}
 fn init_receiver_server(connection_identifier: ConnectionIdentifier) {
     RECEIVER.get_or_init(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -114,6 +111,7 @@ fn init_receiver_server(connection_identifier: ConnectionIdentifier) {
         receiver::NetworkService::start(rt, connection_identifier)
     });
 }
+
 fn receiver_instance() -> Result<Box<ReceiverServer>, Box<dyn Error>> {
     Ok(Box::new(ReceiverServer {
         handle: RECEIVER
@@ -122,17 +120,19 @@ fn receiver_instance() -> Result<Box<ReceiverServer>, Box<dyn Error>> {
             .clone(),
     }))
 }
-fn sender_instance() -> Box<SenderServer> {
-    Box::new(SenderServer {
-        handle: SENDER.clone(),
-    })
+fn sender_instance() -> Result<Box<SenderServer>, Box<dyn Error>> {
+    Ok(Box::new(SenderServer {
+        handle: SENDER
+            .get()
+            .ok_or("Sender server has not been initialized yet.")?
+            .clone(),
+    }))
 }
 
 fn register_receiver_channel(
     server: &mut ReceiverServer,
     channel_identifier: String,
 ) -> Box<ReceiverChannel> {
-    info!("register_receiver_channel({})", channel_identifier);
     let queue = server
         .handle
         .register_channel(channel_identifier.clone())
@@ -169,6 +169,8 @@ fn receive_buffer(
 
     true
 }
+// CXX requires the usage of Boxed types
+#[allow(clippy::boxed_local)]
 fn close_receiver_channel(channel: Box<ReceiverChannel>) {
     channel.data_queue.close();
 }
@@ -217,15 +219,13 @@ fn sender_writes_pending(channel: &SenderChannel) -> bool {
 
 fn flush_channel(channel: &SenderChannel) {
     let (tx, _) = tokio::sync::oneshot::channel();
-    if channel
+    let _ = channel
         .data_queue
-        .send_blocking(ChannelControlMessage::Flush(tx))
-        .is_err()
-    {
-        // already terminated
-        return;
-    }
+        .send_blocking(ChannelControlMessage::Flush(tx));
 }
+
+// CXX requires the usage of Boxed types
+#[allow(clippy::boxed_local)]
 fn close_sender_channel(channel: Box<SenderChannel>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -242,8 +242,4 @@ fn close_sender_channel(channel: Box<SenderChannel>) {
     let _ = channel
         .data_queue
         .send_blocking(ChannelControlMessage::Terminate);
-}
-
-fn enable_logging() {
-    tracing_subscriber::fmt::init();
 }
