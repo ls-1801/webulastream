@@ -1,6 +1,5 @@
 use cxx::SharedPtr;
 use std::fmt::Write;
-use tracing::instrument::WithSubscriber;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::Layer;
@@ -48,22 +47,20 @@ impl SpdlogLayer {
     }
 }
 
-// Helper to format event fields
-struct JsonVisitor<'a>(&'a mut String);
+// Helper to extract the message field
+struct MessageExtractor<'a>(&'a mut String);
 
-impl<'a> tracing::field::Visit for JsonVisitor<'a> {
+impl<'a> tracing::field::Visit for MessageExtractor<'a> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if !self.0.is_empty() {
-            write!(self.0, ", ").unwrap();
+        if field.name() == "message" {
+            write!(self.0, "{:?}", value).unwrap();
         }
-        write!(self.0, "{}={:?}", field.name(), value).unwrap();
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if !self.0.is_empty() {
-            write!(self.0, ", ").unwrap();
+        if field.name() == "message" {
+            *self.0 = value.to_owned();
         }
-        write!(self.0, "{}=\"{}\"", field.name(), value).unwrap();
     }
 
     // Implement other record_* methods as needed
@@ -76,7 +73,7 @@ where
     fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
         // Extract fields via visitor pattern
         let mut message = String::new();
-        let mut visitor = JsonVisitor(&mut message);
+        let mut visitor = MessageExtractor(&mut message);
         event.record(&mut visitor);
 
         // Extract metadata

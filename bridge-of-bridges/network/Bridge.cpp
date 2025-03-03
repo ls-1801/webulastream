@@ -15,9 +15,9 @@
 #include <cstdint>
 #include <iostream>
 #include <Identifiers/Identifiers.hpp>
-#include <cxx_bridge/lib.h>
 #include <rust/cxx.h>
 #include <Bridge.hpp>
+#include <network/lib.h>
 #include <ErrorHandling.hpp>
 
 

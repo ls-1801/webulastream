@@ -3,6 +3,9 @@ name = "distributed_bridge"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+path = "lib.rs"
+
 [dependencies]
 # Generate C++ bindings
 cxx = "1.0.140"
@@ -11,5 +14,5 @@ once_cell = "1.20"
 
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "sync", "time"] }
 async-channel = "2.3.1"
-nes_network = { path = "../network" }
-spdlog_bridge = {path = "../spdlog-bridge"}
+nes_network = { path = "../../network" }
+spdlog_bridge = {path = "../spdlog" }

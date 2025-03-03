@@ -3,6 +3,9 @@ name = "spdlog_bridge"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "lib.rs"
+
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = "0.3"
