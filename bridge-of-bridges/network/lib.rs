@@ -92,7 +92,8 @@ struct ReceiverChannel {
 fn init_sender_server() {
     SENDER.get_or_init(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("receiver")
+            .thread_name("net-receiver")
+            .worker_threads(2)
             .enable_io()
             .enable_time()
             .build()
@@ -103,7 +104,8 @@ fn init_sender_server() {
 fn init_receiver_server(connection_identifier: ConnectionIdentifier) {
     RECEIVER.get_or_init(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("receiver")
+            .thread_name("net-sender")
+            .worker_threads(2)
             .enable_io()
             .enable_time()
             .build()

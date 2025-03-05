@@ -163,21 +163,16 @@ mod channel_handler {
                 return Ok(());
             }
 
+            let next_buffer = pending_writes.front()
+                .expect("BUG: check value earlier");
+
             if writer
-                .feed(DataChannelRequest::Data(
-                    pending_writes
-                        .front()
-                        .expect("BUG: check value earlier")
-                        .clone(),
-                ))
+                .feed(DataChannelRequest::Data(next_buffer.clone()))
                 .await
                 .is_ok()
             {
                 wait_for_ack.insert(
-                    pending_writes
-                        .front()
-                        .expect("BUG: checked value earlier")
-                        .sequence_number,
+                        next_buffer.sequence_number,
                     pending_writes
                         .pop_front()
                         .expect("BUG: checked value earlier"),
