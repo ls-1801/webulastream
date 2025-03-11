@@ -57,7 +57,7 @@ async fn channel_handler(
 
     let (mut reader, mut writer) = data_channel_receiver(stream);
 
-    let mut pending_buffer: Option<TupleBuffer> = None;
+    let mut pending_buffer: Option<TupleBuffer> = None; // TODO why this indirection? Why not directly write to queue?
     info!("Accepted TupleBuffer channel connection from {address}");
     loop {
         if let Some(pending_buffer) = pending_buffer.take() {
@@ -72,6 +72,7 @@ async fn channel_handler(
                             };
                             result.map_err(|e| ChannelHandlerError::Network(e.into()))?
                         },
+                        // TODO in which case would writing to the emit queue fail?
                         Err(_) => {
                             let Some(result) = cancellation_token.run_until_cancelled(writer.send(DataChannelResponse::Close)).await else {
                                 return Err(ChannelHandlerError::Cancelled);
@@ -171,6 +172,7 @@ async fn create_channel_handler(
                 ))
                 .await
                 .expect("ReceiverServer should not have closed, while a channel is active");
+            // TODO is channel_handler also recreated?!
         }
         .instrument(info_span!("channel", channel_id = %channel_id))
     });
@@ -203,7 +205,7 @@ async fn control_socket_handler(
 
         match message {
             ControlChannelRequest::ChannelRequest(channel) => {
-                active_connection_channels.retain(|t: &CancellationToken| !t.is_cancelled());
+                active_connection_channels.retain(|t: &CancellationToken| !t.is_cancelled()); // TODO why GC here?! Why not on remove from map on token cancellation?
                 let Some((emit, token)) = channels.write().await.remove(&channel) else {
                     writer
                         .send(ControlChannelResponse::DenyChannelResponse)
