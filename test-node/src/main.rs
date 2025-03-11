@@ -566,6 +566,7 @@ fn main() {
     let engine = engine::QueryEngine::start();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .thread_name("sender")
+        .worker_threads(2)
         .enable_io()
         .enable_time()
         .build()
@@ -574,6 +575,7 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .thread_name("receiver")
+        .worker_threads(2)
         .enable_io()
         .enable_time()
         .build()
