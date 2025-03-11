@@ -9,7 +9,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, info_span, warn, Instrument};
+use tracing::{Instrument, info, info_span, warn};
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -163,8 +163,7 @@ mod channel_handler {
                 return Ok(());
             }
 
-            let next_buffer = pending_writes.front()
-                .expect("BUG: check value earlier");
+            let next_buffer = pending_writes.front().expect("BUG: check value earlier");
 
             if writer
                 .feed(DataChannelRequest::Data(next_buffer.clone()))
@@ -172,7 +171,7 @@ mod channel_handler {
                 .is_ok()
             {
                 wait_for_ack.insert(
-                        next_buffer.sequence_number,
+                    next_buffer.sequence_number,
                     pending_writes
                         .pop_front()
                         .expect("BUG: checked value earlier"),
@@ -243,7 +242,7 @@ async fn channel_handler(
         Err(e) => {
             return ChannelHandlerResult::ConnectionLost(
                 format!("Could not create socket {e:?}").into(),
-            )
+            );
         }
     };
 
@@ -309,7 +308,7 @@ async fn establish_channel(
                 channel,
                 queue,
                 format!("Could not send channel creation request {}", e).into(),
-            )
+            );
         }
         Some(Ok(())) => {}
     };
@@ -320,17 +319,17 @@ async fn establish_channel(
     {
         Some(Some(Ok(ControlChannelResponse::OkChannelResponse(port)))) => port,
         Some(Some(Ok(ControlChannelResponse::DenyChannelResponse))) => {
-            return EstablishChannelResult::ChannelReject(channel, queue)
+            return EstablishChannelResult::ChannelReject(channel, queue);
         }
         Some(Some(Err(e))) => {
-            return EstablishChannelResult::BadConnection(channel, queue, e.into())
+            return EstablishChannelResult::BadConnection(channel, queue, e.into());
         }
         Some(None) => {
             return EstablishChannelResult::BadConnection(
                 channel,
                 queue,
                 "Connection closed".into(),
-            )
+            );
         }
         None => return EstablishChannelResult::Cancelled,
     };
@@ -525,7 +524,7 @@ async fn connection_handler(
                     .await
                 {
                     None | Some(EstablishChannelResult::Cancelled) => {
-                        return on_cancel(active_channel)
+                        return on_cancel(active_channel);
                     }
                     Some(EstablishChannelResult::Ok(token)) => {
                         active_channel.insert(channel, token);

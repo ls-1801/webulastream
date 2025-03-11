@@ -8,13 +8,13 @@ use crate::engine::{
 use async_channel::TrySendError;
 use bytes::{Buf, BufMut, BytesMut};
 use clap::{Parser, Subcommand};
+use log::error;
 use nes_network::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
 use nes_network::sender::ChannelControlMessage;
 use nes_network::{receiver, sender};
-use log::error;
 use std::collections::{HashSet, VecDeque};
-use std::io::prelude::*;
 use std::io::Cursor;
+use std::io::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio_serde::formats::Cbor;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_serde::Framed;
+use tokio_serde::formats::Cbor;
 use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::codec::{FramedRead, FramedWrite};
 

@@ -7,11 +7,11 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::select;
-use tokio::sync::oneshot;
 use tokio::sync::RwLock;
+use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, info_span, warn, Instrument, Span};
+use tracing::{Instrument, Span, error, info, info_span, warn};
 
 pub struct NetworkService {
     sender: NetworkingServiceController,
@@ -191,7 +191,10 @@ async fn control_socket_handler(
     let mut active_connection_channels = vec![];
     loop {
         let Some(Ok(message)) = reader.next().await else {
-            warn!("Connection was closed. Cancelling {} channel(s)", active_connection_channels.len());
+            warn!(
+                "Connection was closed. Cancelling {} channel(s)",
+                active_connection_channels.len()
+            );
             active_connection_channels
                 .into_iter()
                 .for_each(|t: CancellationToken| t.cancel());
@@ -281,6 +284,7 @@ async fn control_socket(
         }
     }
 }
+
 impl NetworkService {
     pub fn start(
         runtime: Runtime,
@@ -307,7 +311,7 @@ impl NetworkService {
                         control_socket(listener, controller, connection_identifier).await;
                     match control_socket_result {
                         Ok(_) => {
-                            info!("Control stopped")
+                            info!("Control stopped");
                         }
                         Err(e) => {
                             error!("Control stopped: {:?}", e);
