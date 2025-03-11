@@ -13,7 +13,6 @@
 */
 
 #include <cstdint>
-#include <iostream>
 #include <Identifiers/Identifiers.hpp>
 #include <rust/cxx.h>
 #include <Bridge.hpp>

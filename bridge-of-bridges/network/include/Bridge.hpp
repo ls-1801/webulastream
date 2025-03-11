@@ -14,10 +14,9 @@
 
 #pragma once
 
-#include "rust/cxx.h"
+#include <rust/cxx.h>
 
 #include <Runtime/AbstractBufferProvider.hpp>
-#include <folly/Synchronized.h>
 
 struct SerializedTupleBuffer;
 class TupleBufferBuilder
