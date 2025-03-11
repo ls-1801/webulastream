@@ -178,6 +178,10 @@ async fn create_channel_handler(
     rx.await?
         .map_err(|_| "Could not create TupleBuffer channel listener".into())
 }
+
+/// reads ControlChannelRequest.
+/// If: unexpected (i.e. not pre-registered) responds DenyChannelResponse
+/// Else: create_channel_handler
 async fn control_socket_handler(
     stream: TcpStream,
     channels: RegisteredChannels,
@@ -215,6 +219,13 @@ async fn control_socket_handler(
     }
 }
 
+/*
+ listens on the known port
+   on connect: spawns control_socket_handler
+   on ControlMsg (by whom?):
+     RegisterChannel
+     RetryChannel
+*/
 async fn control_socket(
     listener: NetworkingServiceControlListener,
     controller: NetworkingServiceController,

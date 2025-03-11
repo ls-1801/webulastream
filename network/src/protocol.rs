@@ -156,6 +156,7 @@ pub fn control_channel_sender(
     (read, write)
 }
 
+/// wraps TcpStream with framed reader, writer
 pub fn control_channel_receiver(
     stream: TcpStream,
 ) -> (ControlChannelReceiverReader, ControlChannelReceiverWriter) {
