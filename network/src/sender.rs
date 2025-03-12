@@ -371,6 +371,7 @@ async fn establish_channel(
                         }
                     }
                     ChannelHandlerResult::Closed => {
+                        // TODO restart channel
                         info!("Channel closed");
                     }
                 }
