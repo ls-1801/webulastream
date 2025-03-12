@@ -7,11 +7,12 @@ edition = "2024"
 name = "nes_network"
 
 [dependencies]
-tokio = { version = "1.40.0", features = ["macros", "rt", "sync", "net", "io-util", "time"] }
+tokio = { version = "1.40.0", features = ["macros", "rt", "rt-multi-thread", "sync", "net", "io-util", "time"] }
 tokio-util = { version = "0.7.13", features = ["codec"] }
 async-channel = "2.3.1"
 
 tracing = "0.1"
+tracing-subscriber = "0.3"
 
 serde = { version = "1.0.217", features = ["derive"] }
 tokio-stream = "0.1.17"
