@@ -557,6 +557,41 @@ fn bridge(
     query
 }
 
+fn pain() {
+    // is stuck if tracing_subscriber isn't initialized...
+    // tracing_subscriber::fmt().init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_io()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    let service = sender::NetworkService::start(rt);
+
+    println!("1");
+    // TODO ...except if we add this loop
+    // for _ in 1..10000000 {
+    //     info!("foo");
+    // }
+    println!("2");
+
+    match service.register_channel(String::from("foo"), String::from("bar")) {
+        Ok(_)  => info!("ok"),
+        Err(e) => info!("look here: {:?}", e)
+    };
+
+    println!("\nfoo\n");
+
+    match service.shutdown().map_err(|e| e.to_string()) {
+        Ok(_)  => (),
+        Err(e) => info!("{:?}", e)
+    };
+
+    return;
+}
+
 fn main() {
     tracing_subscriber::fmt().init();
     let args = CLIArgs::parse();
