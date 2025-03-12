@@ -582,6 +582,13 @@ async fn create_connection(
     Ok((token, tx))
 }
 
+async fn on_cancel(active_channel: HashMap<ConnectionIdentifier, (CancellationToken, NetworkingConnectionController)>) -> Result<()> {
+    active_channel
+        .into_iter()
+        .for_each(|(_, (token, _))| token.cancel());
+    return Ok(());
+}
+
 async fn network_sender_dispatcher(
     cancellation_token: CancellationToken,
     control: NetworkingServiceControlListener,
@@ -590,27 +597,20 @@ async fn network_sender_dispatcher(
         ConnectionIdentifier,
         (CancellationToken, NetworkingConnectionController),
     > = HashMap::default();
-    let on_cancel = |active_channel: HashMap<
-        ConnectionIdentifier,
-        (CancellationToken, NetworkingConnectionController),
-    >| {
-        active_channel
-            .into_iter()
-            .for_each(|(_, (token, _))| token.cancel());
-        Ok(())
-    };
 
     loop {
+        info!("foo");
         match cancellation_token.run_until_cancelled(control.recv()).await {
-            None => return on_cancel(connections),
+            None => return on_cancel(connections).await,
             Some(Err(_)) => return Err("Queue was closed".into()),
             Some(Ok(NetworkingServiceControlMessage::RegisterChannel(connection, channel, tx))) => {
+                info!("received: RegisterChannel {} {}", connection, channel);
                 if !connections.contains_key(&connection) {
                     match cancellation_token
                         .run_until_cancelled(create_connection(&connection))
                         .await
                     {
-                        None => return on_cancel(connections),
+                        None => return on_cancel(connections).await,
                         Some(Ok((token, controller))) => {
                             connections.insert(connection.clone(), (token, controller));
                         }
@@ -632,7 +632,7 @@ async fn network_sender_dispatcher(
                     )
                     .await
                 {
-                    None => return on_cancel(connections),
+                    None => return on_cancel(connections).await,
                     Some(Err(e)) => {
                         return Err(e)?;
                     }
@@ -642,6 +642,7 @@ async fn network_sender_dispatcher(
         }
     }
 }
+
 impl NetworkService {
     pub fn start(runtime: Runtime) -> Arc<NetworkService> {
         let (controller, listener) = async_channel::bounded(5);
