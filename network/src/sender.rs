@@ -3,6 +3,7 @@ use futures::SinkExt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use tokio::net::TcpSocket;
 use tokio::runtime::Runtime;
@@ -689,6 +690,8 @@ impl NetworkService {
             .take()
             .ok_or("Networking Service was stopped")?;
         self.cancellation_token.cancel();
+        thread::sleep(Duration::from_secs(2));
+        assert!(runtime.metrics().num_alive_tasks() == 0);
         runtime.shutdown_timeout(Duration::from_secs(1));
         Ok(())
     }
