@@ -10,7 +10,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

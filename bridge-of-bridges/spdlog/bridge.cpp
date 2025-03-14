@@ -25,13 +25,18 @@ static std::unordered_map<const char *, std::string> filenames = {};
 
 void log(std::shared_ptr<spdlog::logger> const &logger, int level,
          rust::cxxbridge1::Str filename, unsigned int line,
+         rust::cxxbridge1::Str funcname,
          rust::cxxbridge1::Str message) {
   auto filenameCString =
       filenames.try_emplace(filename.data(), filename.begin(), filename.end())
           .first->second.c_str();
 
+  auto funcnameCString =
+      filenames.try_emplace(funcname.data(), funcname.begin(), funcname.end())
+          .first->second.c_str();
+
   logger->log(
-      spdlog::source_loc{filenameCString, static_cast<int>(line), "RUST"},
+      spdlog::source_loc{filenameCString, static_cast<int>(line), funcnameCString},
       magic_enum::enum_cast<spdlog::level::level_enum>(level).value_or(
           spdlog::level::level_enum::off),
       std::string_view{message});

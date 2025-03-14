@@ -18,4 +18,4 @@
 #include <rust/cxx.h>
 
 using SpdLogger = spdlog::logger;
-void log(::std::shared_ptr<::SpdLogger> const &, ::std::int32_t, ::rust::Str, ::std::uint32_t, ::rust::Str);
+void log(::std::shared_ptr<::SpdLogger> const &, ::std::int32_t, ::rust::Str, ::std::uint32_t, ::rust::Str, ::rust::Str);

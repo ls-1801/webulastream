@@ -1,4 +1,10 @@
 use cxx::SharedPtr;
+use tracing::span::Attributes;
+use tracing::span::Id;
+use tracing::span::Record;
+use tracing::field::Field;
+use tracing_subscriber::layer::Context;
+use std::error::Error;
 use std::fmt::Write;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::prelude::*;
@@ -22,7 +28,7 @@ mod ffi {
     unsafe extern "C++" {
         include!("bridge.hpp");
         type SpdLogger;
-        fn log(log: &SharedPtr<SpdLogger>, level: i32, file: &str, line_number: u32, message: &str);
+        fn log(log: &SharedPtr<SpdLogger>, level: i32, file: &str, line_number: u32, func: &str, message: &str);
     }
 }
 unsafe impl Send for ffi::SpdLogger {}
@@ -66,11 +72,53 @@ impl<'a> tracing::field::Visit for MessageExtractor<'a> {
     // Implement other record_* methods as needed
 }
 
+struct ME<'a>(&'a mut String);
+
+impl<'a> tracing::field::Visit for ME<'a> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        *self.0 += if self.0.is_empty() { "(" } else { "; " };
+        *self.0 += field.name();
+        *self.0 += ": ";
+        write!(self.0, "{:?}", value).unwrap();
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        *self.0 += field.name();
+        *self.0 += " ";
+        *self.0 += value;
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        panic!("not implemented")
+    }
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        panic!("not implemented")
+    }
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        panic!("not implemented")
+    }
+    fn record_i128(&mut self, field: &Field, value: i128) {
+        panic!("not implemented")
+    }
+    fn record_u128(&mut self, field: &Field, value: u128) {
+        panic!("not implemented")
+    }
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        panic!("not implemented")
+    }
+    fn record_bytes(&mut self, field: &Field, value: &[u8]) {
+        panic!("not implemented")
+    }
+    fn record_error(&mut self, field: &Field, value: &(dyn Error + 'static)) {
+        panic!("not implemented")
+    }
+}
+
 impl<S> Layer<S> for SpdlogLayer
 where
     S: Subscriber,
 {
-    fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         // Extract fields via visitor pattern
         let mut message = String::new();
         let mut visitor = MessageExtractor(&mut message);
@@ -82,8 +130,32 @@ where
         let line = metadata.line().unwrap_or(0);
         let level = Self::convert_level(metadata.level());
 
-        ffi::log(&self.logger, level, file, line, message.as_str());
+        ffi::log(&self.logger, level, file, line, "RUST", message.as_str());
     }
+
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        let metadata = attrs.metadata();
+        let file = metadata.file().unwrap_or("");
+        let line = metadata.line().unwrap_or(0);
+        let func = metadata.name();
+
+        let level = Self::convert_level(metadata.level());
+
+        let mut msg = String::new();
+        let mut vis = ME(&mut msg);
+        attrs.record(&mut vis);
+
+        ffi::log(&self.logger, level, file, line, func, msg.as_str())
+    }
+
+    fn on_record(&self, _span: &Id, _values: &Record<'_>, _ctx: Context<'_, S>) {
+        // ffi::log(&self.logger, 4, "foo", 3, format!("on_record {:?}", _span).as_str());
+    }
+
+    fn on_enter(&self, _id: &Id, _ctx: Context<'_, S>) {
+        // ffi::log(&self.logger, 4, "foo", 3, format!("on_enter {:?}", _id).as_str());
+    }
+
 }
 
 fn initialize_logging(logger: SharedPtr<ffi::SpdLogger>) {
