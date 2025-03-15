@@ -15,17 +15,10 @@ fn start_and_stop_sender() -> Result<(), String> {
         .build()
         .unwrap();
 
-    let service = NetworkService::start(rt);
+    let service = sender::NetworkService::start(rt);
 
-    match service.register_channel(String::from("foo"), String::from("bar")) {
-        Ok(_)  => (),
-        Err(e) => println!("{:?}", e)
-    };
-
-    match service.shutdown().map_err(|e| e.to_string()) {
-        Ok(_)  => (),
-        Err(e) => println!("{:?}", e)
-    };
+    service.register_channel(String::from("foo"), String::from("bar")).map_err(|e| e.to_string())?;
+    service.shutdown().map_err(|e| e.to_string())?;
 
     Ok(())
 }
