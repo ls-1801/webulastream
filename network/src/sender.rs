@@ -374,7 +374,8 @@ async fn establish_channel(
                         }
                     }
                     ChannelHandlerResult::Closed => {
-                        // TODO restart channel
+                        // TODO restart channel: re-call establish channel one layer up?
+                        // since  this is spawned, it needs to send a retry request to some channel
                         info!("Channel closed");
                     }
                 }
@@ -692,6 +693,8 @@ impl NetworkService {
         rx.blocking_recv()
             .map_err(|_| "Network Service Closed".into())
     }
+
+    // TODO close channel when query terminated
 
     pub fn shutdown(self: Arc<NetworkService>) -> Result<()> {
         let runtime = self
