@@ -18,3 +18,4 @@ serde = { version = "1.0.217", features = ["derive"] }
 tokio-stream = "0.1.17"
 tokio-serde = { version = "0.9", features = ["cbor", "serde_cbor"] }
 futures = "0.3.31"
+console-subscriber = "0.4.1"
