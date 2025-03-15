@@ -41,22 +41,3 @@ fn start_and_stop_receiver() -> Result<(), String> {
 
     Ok(())
 }
-
-#[test]
-fn foo() -> Result<(), String> {
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_io()
-        .enable_time()
-        .build()
-        .unwrap();
-
-    rt.spawn(async {
-        sleep(Duration::from_secs(100)).await;
-    });
-
-    print!("{}", rt.metrics().num_alive_tasks());
-
-    Ok(())
-}
