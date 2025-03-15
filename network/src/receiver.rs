@@ -84,9 +84,14 @@ async fn channel_handler(
             }
         }
 
+        info!("pre-select");
         select! {
-            _ = cancellation_token.cancelled() => return Err(ChannelHandlerError::Cancelled),
+            _ = cancellation_token.cancelled() => {
+                info!("err");
+                return Err(ChannelHandlerError::Cancelled);
+            },
             request = reader.next() => pending_buffer = {
+                info!("\nnext\n");
                 match request.ok_or(ChannelHandlerError::Network("Connection Lost".into()))?.map_err(|e| ChannelHandlerError::Network(e.into()))? {
                     DataChannelRequest::Data(buffer) => Some(buffer),
                     DataChannelRequest::Close => {

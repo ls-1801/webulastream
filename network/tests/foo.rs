@@ -1,4 +1,4 @@
-use std::vec;
+use std::{thread::sleep, time::Duration, vec};
 
 use futures::executor;
 use nes_network::{protocol::TupleBuffer, receiver, sender::{self, ChannelControlMessage}};
@@ -6,7 +6,8 @@ use nes_network::{protocol::TupleBuffer, receiver, sender::{self, ChannelControl
 #[test]
 fn start_and_stop_sender() -> Result<(), String> {
     // TODO whyyyy stuck without subscriber?!
-    tracing_subscriber::fmt().init();
+    // tracing_subscriber::fmt().init();
+    console_subscriber::init();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -16,6 +17,8 @@ fn start_and_stop_sender() -> Result<(), String> {
         .unwrap();
 
     let service = sender::NetworkService::start(rt);
+
+    sleep(Duration::from_secs(10));
 
     service.register_channel(String::from("foo"), String::from("bar")).map_err(|e| e.to_string())?;
     service.shutdown().map_err(|e| e.to_string())?;
@@ -44,7 +47,8 @@ fn start_and_stop_receiver() -> Result<(), String> {
 
 #[test]
 fn send_and_receive() -> Result<(), String> {
-    tracing_subscriber::fmt().init();
+    // tracing_subscriber::fmt().init();
+    console_subscriber::init();
 
     let conn = String::from("127.0.0.1:13254");
     let chan = String::from("123");

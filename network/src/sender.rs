@@ -353,7 +353,9 @@ async fn establish_channel(
                 )
                 .await
                 {
-                    ChannelHandlerResult::Cancelled => {}
+                    ChannelHandlerResult::Cancelled => {
+                        info!("Cancelled");
+                    }
                     ChannelHandlerResult::ConnectionLost(e) => {
                         warn!("Connection Lost: {e:?}");
                         match &channel_cancellation_token
@@ -507,12 +509,14 @@ async fn connection_handler(
             {
                 pending_channels.append(&mut new_pending_channels);
             } else {
+                warn!("accept_chan_req returned None");
                 return on_cancel(active_channel);
             }
 
             let mut updated_pending_channels = vec![];
             let mut connection_failure = false;
             for (channel, channel_cancellation_token, queue) in pending_channels {
+                info!("pending channgel: {}", channel);
                 if channel_cancellation_token.is_cancelled() {
                     continue;
                 }
@@ -520,6 +524,7 @@ async fn connection_handler(
                     updated_pending_channels.push((channel, channel_cancellation_token, queue));
                     continue;
                 }
+                info!("establishing {}", channel);
                 match connection_cancellation_token
                     .run_until_cancelled(establish_channel(
                         &mut writer,
@@ -533,9 +538,11 @@ async fn connection_handler(
                     .await
                 {
                     None | Some(EstablishChannelResult::Cancelled) => {
+                        warn!("None | Some(ECR::Cancelled");
                         return on_cancel(active_channel);
                     }
                     Some(EstablishChannelResult::Ok(token)) => {
+                        info!("active channel {}", channel);
                         active_channel.insert(channel, token);
                     }
                     Some(EstablishChannelResult::ChannelReject(channel, queue)) => {
@@ -681,14 +688,7 @@ impl NetworkService {
         channel: ChannelIdentifier,
     ) -> Result<channel_handler::ChannelControlQueue> {
         let (tx, rx) = oneshot::channel();
-        let Ok(_) =
-            self.controller
-                .send_blocking(NetworkingServiceControlMessage::RegisterChannel(
-                    connection, channel, tx,
-                ))
-        else {
-            return Err("Network Service Closed".into());
-        };
+        self.controller.send_blocking(NetworkingServiceControlMessage::RegisterChannel(connection, channel, tx))?;
 
         rx.blocking_recv()
             .map_err(|_| "Network Service Closed".into())
