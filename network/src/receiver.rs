@@ -91,7 +91,6 @@ async fn channel_handler(
                 return Err(ChannelHandlerError::Cancelled);
             },
             request = reader.next() => pending_buffer = {
-                info!("\nnext\n");
                 match request.ok_or(ChannelHandlerError::Network("Connection Lost".into()))?.map_err(|e| ChannelHandlerError::Network(e.into()))? {
                     DataChannelRequest::Data(buffer) => Some(buffer),
                     DataChannelRequest::Close => {
