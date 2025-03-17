@@ -118,3 +118,42 @@ fn send_and_receive_1000() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn send_recv_restart_receiver() -> Result<(), String> {
+    tracing_subscriber::fmt().init();
+
+    let conn = String::from("127.0.0.1:13254");
+    let chan = String::from("123");
+
+    let rceivr = receiver::NetworkService::start(make_rt(), conn.clone());
+    let sender = sender::NetworkService::start(make_rt());
+
+    let sender_chan = sender.register_channel(conn.clone(), chan.clone()).map_err(|e| e.to_string())?;
+
+    let t = make_tb(1);
+    let msg = ChannelControlMessage::Data(t.clone());
+
+    executor::block_on(sender_chan.send(msg)).map_err(|e| e.to_string())?;
+
+    let rceivr_chan = rceivr.register_channel(chan.clone()).map_err(|e| e.to_string())?;
+    let t1 = rceivr_chan.recv_blocking().map_err(|e| e.to_string())?;
+    assert_eq!(t, t1);
+
+    std::mem::drop(rceivr);
+
+    let rceivr = receiver::NetworkService::start(make_rt(), conn.clone());
+
+    let t = make_tb(2);
+    let msg = ChannelControlMessage::Data(t.clone());
+
+    executor::block_on(sender_chan.send(msg)).map_err(|e| e.to_string())?;
+
+    let rceivr_chan = rceivr.register_channel(chan.clone()).map_err(|e| e.to_string())?;
+    let t1 = rceivr_chan.recv_blocking().map_err(|e| e.to_string())?;
+    assert_eq!(t, t1);
+
+    sender.shutdown().map_err(|e| e.to_string())?;
+
+    Ok(())
+}
