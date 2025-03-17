@@ -436,6 +436,8 @@ async fn accept_channel_requests(
     Some(pending)
 }
 
+/// runs for connection to one other node
+/// might manage multiple channels
 async fn connection_handler(
     connection_cancellation_token: CancellationToken,
     receiver_addr: SocketAddr,
