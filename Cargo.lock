@@ -1432,6 +1432,7 @@ dependencies = [
  "pin-project",
  "serde",
  "serde_cbor",
+ "serde_json",
 ]
 
 [[package]]
