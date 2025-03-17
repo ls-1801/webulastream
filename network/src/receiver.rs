@@ -3,6 +3,7 @@ use futures::SinkExt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
@@ -16,6 +17,7 @@ use tracing::{Instrument, Span, error, info, info_span, warn};
 pub struct NetworkService {
     sender: NetworkingServiceController,
     runtime: Mutex<Option<Runtime>>,
+    cancellation_token: CancellationToken,
 }
 
 enum NetworkingServiceControl {
@@ -239,6 +241,7 @@ async fn control_socket(
     listener: NetworkingServiceControlListener,
     controller: NetworkingServiceController,
     connection_identifier: ConnectionIdentifier,
+    cancellation_token: CancellationToken,
 ) -> Result<()> {
     info!("Starting control socket: {}", connection_identifier);
     let listener_port = TcpListener::bind(connection_identifier.parse::<SocketAddr>()?).await?;
@@ -273,7 +276,7 @@ async fn control_socket(
                     return Ok(())
                 },
                 Ok(NetworkingServiceControl::RegisterChannel(ident,emit_fn, response)) => {
-                    let token = CancellationToken::new();
+                    let token = cancellation_token.clone();
                     {
                         let mut locked = registered_channels.write().await;
                         locked.retain(|_, (_, token)| !token.is_cancelled());
@@ -297,9 +300,11 @@ impl NetworkService {
         connection_identifier: ConnectionIdentifier,
     ) -> Arc<NetworkService> {
         let (tx, rx) = async_channel::bounded(10);
+        let cancellation_token = CancellationToken::new();
         let service = Arc::new(NetworkService {
             sender: tx.clone(),
             runtime: Mutex::new(Some(runtime)),
+            cancellation_token: cancellation_token.clone(),
         });
 
         service
@@ -311,10 +316,11 @@ impl NetworkService {
             .spawn({
                 let listener = rx;
                 let controller = tx;
+                let token = cancellation_token.clone();
                 async move {
                     info!("Starting Control");
                     let control_socket_result =
-                        control_socket(listener, controller, connection_identifier).await;
+                        control_socket(listener, controller, connection_identifier, token).await;
                     match control_socket_result {
                         Ok(_) => {
                             info!("Control stopped");
@@ -358,6 +364,10 @@ impl NetworkService {
             .expect("BUG: No one should panic while holding this lock")
             .take()
             .ok_or("Networking Service was stopped")?;
+
+        self.cancellation_token.cancel();
+        thread::sleep(Duration::from_secs(2));
+        assert!(runtime.metrics().num_alive_tasks() == 0);
         runtime.shutdown_timeout(Duration::from_secs(1));
         Ok(())
     }
