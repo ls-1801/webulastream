@@ -82,3 +82,40 @@ fn send_and_receive() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn send_and_receive_1000() -> Result<(), String> {
+    tracing_subscriber::fmt().init();
+
+    let conn = String::from("127.0.0.1:13254");
+    let chan = String::from("123");
+
+    let rceivr = receiver::NetworkService::start(make_rt(), conn.clone());
+    let sender = sender::NetworkService::start(make_rt());
+
+    let sender_chan = sender.register_channel(conn.clone(), chan.clone()).map_err(|e| e.to_string())?;
+    let rceivr_chan = rceivr.register_channel(chan.clone()).map_err(|e| e.to_string())?;
+
+    let num_send_recvs = 1000;
+
+    let mut send_tbs = Vec::new();
+
+    for i in 0..num_send_recvs {
+        let t = make_tb(i);
+        send_tbs.push(t.clone());
+        let msg = ChannelControlMessage::Data(t.clone());
+
+        executor::block_on(sender_chan.send(msg)).map_err(|e| e.to_string())?;
+    }
+
+
+    for i in 0..num_send_recvs {
+        let t = rceivr_chan.recv_blocking().map_err(|e| e.to_string())?;
+        assert_eq!(send_tbs[i as usize], t);
+    }
+
+    sender.shutdown().map_err(|e| e.to_string())?;
+    rceivr.shutdown().map_err(|e| e.to_string())?;
+
+    Ok(())
+}
