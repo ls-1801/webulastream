@@ -22,7 +22,7 @@ fn start_and_stop_sender() -> Result<(), String> {
 
     sleep(Duration::from_secs(10));
 
-    service.register_channel(String::from("foo"), String::from("bar")).map_err(|e| e.to_string())?;
+    service.register_channel(String::from("127.0.0.1:0"), String::from("bar")).map_err(|e| e.to_string())?;
     service.shutdown().map_err(|e| e.to_string())?;
 
     Ok(())
