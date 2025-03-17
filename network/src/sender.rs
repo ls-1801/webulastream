@@ -167,7 +167,7 @@ mod channel_handler {
             let next_buffer = pending_writes.front().expect("BUG: check value earlier");
 
             if writer
-                .feed(DataChannelRequest::Data(next_buffer.clone()))
+                .send(DataChannelRequest::Data(next_buffer.clone()))
                 .await
                 .is_ok()
             {
