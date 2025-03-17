@@ -41,9 +41,9 @@ fn start_and_stop_receiver() -> Result<(), String> {
     Ok(())
 }
 
-fn make_tb() -> TupleBuffer {
+fn make_tb(seq_no: u64) -> TupleBuffer {
     TupleBuffer {
-            sequence_number: 1,
+            sequence_number: seq_no,
             watermark: 1,
             origin_id: 1,
             chunk_number: 1,
@@ -66,7 +66,7 @@ fn send_and_receive() -> Result<(), String> {
 
     let sender_chan = sender.register_channel(conn.clone(), chan.clone()).map_err(|e| e.to_string())?;
 
-    let t = make_tb();
+    let t = make_tb(0);
     let msg = ChannelControlMessage::Data(t.clone());
 
     executor::block_on(sender_chan.send(msg)).map_err(|e| e.to_string())?;
