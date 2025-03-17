@@ -47,8 +47,7 @@ fn start_and_stop_receiver() -> Result<(), String> {
 
 #[test]
 fn send_and_receive() -> Result<(), String> {
-    // tracing_subscriber::fmt().init();
-    console_subscriber::init();
+    tracing_subscriber::fmt().init();
 
     let conn = String::from("127.0.0.1:13254");
     let chan = String::from("123");
