@@ -137,16 +137,12 @@ mod channel_handler {
                         warn!("NAck for {seq}");
                         self.pending_writes.push_back(write);
                     } else {
-                        return Err(ChannelHandlerError::Protocol(
-                            format!("Protocol Error. Unknown Seq {seq}").into(),
-                        ));
+                        panic!("Protocol Error: expected Seq {seq}");
                     }
                 }
                 DataChannelResponse::AckData(seq) => {
                     let Some(_) = self.wait_for_ack.remove(&seq) else {
-                        return Err(ChannelHandlerError::Protocol(
-                            format!("Protocol Error. Unknown Seq {seq}").into(),
-                        ));
+                        panic!("Protocol Error: expected Seq {seq}");
                     };
                     trace!("Ack for {seq}");
                 }
