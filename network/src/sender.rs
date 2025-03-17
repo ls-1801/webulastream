@@ -230,7 +230,6 @@ mod channel_handler {
 }
 
 
-#[tracing::instrument]
 async fn channel_handler(
     cancellation_token: CancellationToken,
     channel_address: SocketAddr,
@@ -285,7 +284,6 @@ enum EstablishChannelResult {
     Cancelled,
 }
 
-#[tracing::instrument]
 async fn establish_channel(
     control_channel_sender_writer: &mut ControlChannelSenderWriter,
     control_channel_sender_reader: &mut ControlChannelSenderReader,
@@ -438,7 +436,6 @@ async fn accept_channel_requests(
     Some(pending)
 }
 
-#[tracing::instrument]
 async fn connection_handler(
     connection_cancellation_token: CancellationToken,
     connection_identifier: ConnectionIdentifier,
@@ -567,7 +564,6 @@ async fn connection_handler(
         }
     }
 }
-#[tracing::instrument]
 async fn create_connection(
     connection: &ConnectionIdentifier,
 ) -> Result<(CancellationToken, NetworkingConnectionController)> {
@@ -600,7 +596,6 @@ async fn on_cancel(active_channel: HashMap<ConnectionIdentifier, (CancellationTo
     return Ok(());
 }
 
-#[tracing::instrument]
 async fn network_sender_dispatcher(
     cancellation_token: CancellationToken,
     control: NetworkingServiceControlListener,
@@ -656,7 +651,6 @@ async fn network_sender_dispatcher(
 }
 
 impl NetworkService {
-    #[tracing::instrument]
     pub fn start(runtime: Runtime) -> Arc<NetworkService> {
         let (controller, listener) = async_channel::bounded(5);
         let cancellation_token = CancellationToken::new();
