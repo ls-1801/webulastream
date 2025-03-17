@@ -568,7 +568,7 @@ async fn connection_handler(
 }
 
 async fn create_connection(
-    connection: &SocketAddr,
+    receiver_addr: &SocketAddr,
 ) -> Result<(CancellationToken, NetworkingConnectionController)> {
     let (tx, rx) = async_channel::bounded::<NetworkingConnectionControlMessage>(1024);
     let control = tx.clone();
@@ -576,17 +576,17 @@ async fn create_connection(
     tokio::spawn(
         {
             let token = token.clone();
-            let connection = connection.clone();
+            let receiver_addr = receiver_addr.clone();
             async move {
                 info!(
                     "Connection is terminated: {:?}",
-                    connection_handler(token, connection, control, rx).await
+                    connection_handler(token, receiver_addr, control, rx).await
                 );
             }
         }
         .instrument(info_span!(
             "connection_handler",
-            connection = connection.clone()
+            connection = receiver_addr.to_string()
         )),
     );
     Ok((token, tx))
