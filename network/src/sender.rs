@@ -22,7 +22,7 @@ pub struct NetworkService {
 
 enum NetworkingServiceControlMessage {
     RegisterChannel(
-        ConnectionIdentifier,
+        SocketAddr,
         ChannelIdentifier,
         oneshot::Sender<ChannelControlQueue>,
     ),
@@ -284,10 +284,11 @@ enum EstablishChannelResult {
     Cancelled,
 }
 
+/// handshake with receiver: ChanReq, ChanResp(port)
 async fn establish_channel(
     control_channel_sender_writer: &mut ControlChannelSenderWriter,
     control_channel_sender_reader: &mut ControlChannelSenderReader,
-    connection_identifier: &ConnectionIdentifier,
+    connection_identifier: &SocketAddr,
     channel: ChannelIdentifier,
     channel_cancellation_token: CancellationToken,
     queue: channel_handler::ChannelControlQueueListener,
@@ -332,8 +333,7 @@ async fn establish_channel(
         None => return EstablishChannelResult::Cancelled,
     };
 
-    let channel_address = connection_identifier.parse::<SocketAddr>().expect("The Connection identifier should not be an invalid address, as the connection should have already been established");
-    let channel_address = SocketAddr::new(channel_address.ip(), port);
+    let channel_address = SocketAddr::new(connection_identifier.ip(), port);
 
     tokio::spawn(
         {
@@ -438,7 +438,7 @@ async fn accept_channel_requests(
 
 async fn connection_handler(
     connection_cancellation_token: CancellationToken,
-    connection_identifier: ConnectionIdentifier,
+    receiver_addr: SocketAddr,
     controller: NetworkingConnectionController,
     mut listener: NetworkingConnectionControlListener,
 ) -> Result<()> {
@@ -473,7 +473,7 @@ async fn connection_handler(
 
         let socket = TcpSocket::new_v4()?;
         let connection = match connection_cancellation_token
-            .run_until_cancelled(socket.connect(connection_identifier.parse()?))
+            .run_until_cancelled(socket.connect(receiver_addr))
             .await
         {
             None => return on_cancel(active_channel),
@@ -522,7 +522,7 @@ async fn connection_handler(
                     .run_until_cancelled(establish_channel(
                         &mut writer,
                         &mut reader,
-                        &connection_identifier,
+                        &receiver_addr,
                         channel.clone(),
                         channel_cancellation_token.clone(),
                         queue,
@@ -564,8 +564,9 @@ async fn connection_handler(
         }
     }
 }
+
 async fn create_connection(
-    connection: &ConnectionIdentifier,
+    connection: &SocketAddr,
 ) -> Result<(CancellationToken, NetworkingConnectionController)> {
     let (tx, rx) = async_channel::bounded::<NetworkingConnectionControlMessage>(1024);
     let control = tx.clone();
@@ -589,7 +590,7 @@ async fn create_connection(
     Ok((token, tx))
 }
 
-async fn on_cancel(active_channel: HashMap<ConnectionIdentifier, (CancellationToken, NetworkingConnectionController)>) -> Result<()> {
+async fn on_cancel(active_channel: HashMap<SocketAddr, (CancellationToken, NetworkingConnectionController)>) -> Result<()> {
     active_channel
         .into_iter()
         .for_each(|(_, (token, _))| token.cancel());
@@ -601,7 +602,7 @@ async fn network_sender_dispatcher(
     control: NetworkingServiceControlListener,
 ) -> Result<()> {
     let mut connections: HashMap<
-        ConnectionIdentifier,
+        SocketAddr,
         (CancellationToken, NetworkingConnectionController),
     > = HashMap::default();
 
@@ -678,6 +679,7 @@ impl NetworkService {
         channel: ChannelIdentifier,
     ) -> Result<channel_handler::ChannelControlQueue> {
         let (tx, rx) = oneshot::channel();
+        let connection = connection.parse()?;
         self.controller.send_blocking(NetworkingServiceControlMessage::RegisterChannel(connection, channel, tx))?;
 
         rx.blocking_recv()
