@@ -16,8 +16,7 @@ fn make_rt() -> Runtime {
 #[test]
 fn start_and_stop_sender() -> Result<(), String> {
     // TODO whyyyy stuck without subscriber?!
-    // tracing_subscriber::fmt().init();
-    console_subscriber::init();
+    tracing_subscriber::fmt().init();
 
     let service = sender::NetworkService::start(make_rt());
 
