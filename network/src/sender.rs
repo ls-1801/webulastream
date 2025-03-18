@@ -16,19 +16,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub struct NetworkService {
     runtime: Mutex<Option<Runtime>>,
-    controller: NetworkingServiceController,
     cancellation_token: CancellationToken,
+    connections: Mutex<HashMap<SocketAddr, (CancellationToken, NetworkingConnectionController)>>,
 }
 
-enum NetworkingServiceControlMessage {
-    RegisterChannel(
-        SocketAddr,
-        ChannelIdentifier,
-        oneshot::Sender<ChannelControlQueue>,
-    ),
-}
 #[derive(Debug)]
-enum NetworkingConnectionControlMessage {
+pub enum NetworkingConnectionControlMessage {
     RegisterChannel(ChannelIdentifier, oneshot::Sender<ChannelControlQueue>),
     RetryChannel(
         ChannelIdentifier,
@@ -38,8 +31,6 @@ enum NetworkingConnectionControlMessage {
 }
 pub type ChannelControlMessage = channel_handler::ChannelControlMessage;
 pub type ChannelControlQueue = channel_handler::ChannelControlQueue;
-type NetworkingServiceController = async_channel::Sender<NetworkingServiceControlMessage>;
-type NetworkingServiceControlListener = async_channel::Receiver<NetworkingServiceControlMessage>;
 type NetworkingConnectionController = async_channel::Sender<NetworkingConnectionControlMessage>;
 type NetworkingConnectionControlListener =
     async_channel::Receiver<NetworkingConnectionControlMessage>;
@@ -484,7 +475,7 @@ async fn connection_handler(
             Some(Err(e)) => {
                 retry += 1;
                 warn!("Could not establish connection {}.Retry in {} s", e, retry);
-                tokio::time::sleep(Duration::from_secs(retry)).await;
+                connection_cancellation_token.run_until_cancelled(tokio::time::sleep(Duration::from_secs(1))).await;
                 continue;
             }
         };
@@ -568,125 +559,50 @@ async fn connection_handler(
     }
 }
 
-async fn create_connection(
-    receiver_addr: &SocketAddr,
-) -> Result<(CancellationToken, NetworkingConnectionController)> {
-    let (tx, rx) = async_channel::bounded::<NetworkingConnectionControlMessage>(1024);
-    let control = tx.clone();
-    let token = CancellationToken::new();
-    tokio::spawn(
-        {
-            let token = token.clone();
-            let receiver_addr = receiver_addr.clone();
-            async move {
-                info!(
-                    "Connection is terminated: {:?}",
-                    connection_handler(token, receiver_addr, control, rx).await
-                );
-            }
-        }
-        .instrument(info_span!(
-            "connection_handler",
-            connection = receiver_addr.to_string()
-        )),
-    );
-    Ok((token, tx))
-}
-
-async fn on_cancel(active_channel: HashMap<SocketAddr, (CancellationToken, NetworkingConnectionController)>) -> Result<()> {
-    active_channel
-        .into_iter()
-        .for_each(|(_, (token, _))| token.cancel());
-    return Ok(());
-}
-
-async fn network_sender_dispatcher(
-    cancellation_token: CancellationToken,
-    control: NetworkingServiceControlListener,
-) -> Result<()> {
-    let mut connections: HashMap<
-        SocketAddr,
-        (CancellationToken, NetworkingConnectionController),
-    > = HashMap::default();
-
-    loop {
-        info!("network_sender_dispatcher loop");
-        match cancellation_token.run_until_cancelled(control.recv()).await {
-            None => return on_cancel(connections).await,
-            Some(Err(_)) => return Err("Queue was closed".into()),
-            Some(Ok(NetworkingServiceControlMessage::RegisterChannel(connection, channel, tx))) => {
-                info!("received: RegisterChannel {} {}", connection, channel);
-                if !connections.contains_key(&connection) {
-                    match cancellation_token
-                        .run_until_cancelled(create_connection(&connection))
-                        .await
-                    {
-                        None => return on_cancel(connections).await,
-                        Some(Ok((token, controller))) => {
-                            connections.insert(connection.clone(), (token, controller));
-                        }
-                        Some(Err(e)) => {
-                            return Err(e);
-                        }
-                    }
-                }
-
-                match cancellation_token
-                    .run_until_cancelled(
-                        connections
-                            .get(&connection)
-                            .expect("BUG: Just inserted the key")
-                            .1
-                            .send(NetworkingConnectionControlMessage::RegisterChannel(
-                                channel, tx,
-                            )),
-                    )
-                    .await
-                {
-                    None => return on_cancel(connections).await,
-                    Some(Err(e)) => {
-                        return Err(e)?;
-                    }
-                    Some(Ok(())) => {}
-                }
-            }
-        }
-    }
-}
-
 impl NetworkService {
     pub fn start(runtime: Runtime) -> Arc<NetworkService> {
-        let (controller, listener) = async_channel::bounded(5);
         let cancellation_token = CancellationToken::new();
-        runtime.spawn({
-            let token = cancellation_token.clone();
-            async move {
-                info!("Starting sender network service");
-                info!(
-                    "sender network service stopped: {:?}",
-                    network_sender_dispatcher(token, listener).await
-                );
-            }
-        });
 
         Arc::new(NetworkService {
             runtime: Mutex::new(Some(runtime)),
             cancellation_token,
-            controller,
+            connections: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn register_channel(
         self: &Arc<NetworkService>,
-        connection: ConnectionIdentifier,
+        receiver_addr: ConnectionIdentifier,
         channel: ChannelIdentifier,
     ) -> Result<channel_handler::ChannelControlQueue> {
+        let receiver_addr: SocketAddr = receiver_addr.parse()?;
         let (tx, rx) = oneshot::channel();
-        let connection = connection.parse()?;
-        self.controller.send_blocking(NetworkingServiceControlMessage::RegisterChannel(connection, channel, tx))?;
 
-        rx.blocking_recv()
-            .map_err(|_| "Network Service Closed".into())
+        let mut connections = self.connections.lock().unwrap();
+        let conn_controller = match connections.get(&receiver_addr) {
+            None => {
+                let (tx, rx) = async_channel::bounded::<NetworkingConnectionControlMessage>(1024);
+                let control = tx.clone();
+                let token = self.cancellation_token.clone();
+                let mut locked_rt = self.runtime.lock().unwrap();
+                let rt = locked_rt.take().unwrap();
+                rt.spawn({
+                        let token = token.clone();
+                        let receiver_addr = receiver_addr.clone();
+                        async move {
+                            let x = connection_handler(token, receiver_addr, control, rx).await;
+                            info!("Connection is terminated: {:?}", x);
+                        }
+                    }
+                );
+                locked_rt.replace(rt);
+                connections.insert(receiver_addr.clone(), (token, tx.clone()));
+                tx
+            },
+            Some((_, tx)) => tx.clone()
+        };
+        conn_controller.send_blocking(NetworkingConnectionControlMessage::RegisterChannel(channel, tx))?;
+        rx.blocking_recv().map_err(|_| "Network Service Closed".into())
     }
 
     // TODO close channel when query terminated
