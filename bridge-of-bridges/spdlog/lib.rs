@@ -76,41 +76,66 @@ struct ME<'a>(&'a mut String);
 
 impl<'a> tracing::field::Visit for ME<'a> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        *self.0 += if self.0.is_empty() { "(" } else { "; " };
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
         *self.0 += field.name();
         *self.0 += ": ";
         write!(self.0, "{:?}", value).unwrap();
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
         *self.0 += field.name();
         *self.0 += " ";
         *self.0 += value;
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        panic!("not implemented")
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
+        *self.0 += field.name();
+        *self.0 += " ";
+        *self.0 += value.to_string().as_str();
     }
     fn record_i64(&mut self, field: &Field, value: i64) {
-        panic!("not implemented")
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
+        *self.0 += field.name();
+        *self.0 += " ";
+        *self.0 += value.to_string().as_str();
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
-        panic!("not implemented")
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
+        *self.0 += field.name();
+        *self.0 += " ";
+        *self.0 += value.to_string().as_str();
     }
     fn record_i128(&mut self, field: &Field, value: i128) {
-        panic!("not implemented")
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
+        *self.0 += field.name();
+        *self.0 += " ";
+        *self.0 += value.to_string().as_str();
     }
     fn record_u128(&mut self, field: &Field, value: u128) {
-        panic!("not implemented")
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
+        *self.0 += field.name();
+        *self.0 += " ";
+        *self.0 += value.to_string().as_str();
     }
     fn record_bool(&mut self, field: &Field, value: bool) {
-        panic!("not implemented")
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
+        *self.0 += field.name();
+        *self.0 += " ";
+        *self.0 += value.to_string().as_str();
     }
     fn record_bytes(&mut self, field: &Field, value: &[u8]) {
-        panic!("not implemented")
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
+        *self.0 += field.name();
+        *self.0 += " ";
+        *self.0 += value.escape_ascii().to_string().as_str();
     }
     fn record_error(&mut self, field: &Field, value: &(dyn Error + 'static)) {
-        panic!("not implemented")
+        *self.0 += if self.0.is_empty() { "" } else { "; " };
+        *self.0 += field.name();
+        *self.0 += " ";
+        *self.0 += value.to_string().as_str();
     }
 }
 
@@ -145,7 +170,12 @@ where
         let mut vis = ME(&mut msg);
         attrs.record(&mut vis);
 
-        ffi::log(&self.logger, level, file, line, func, msg.as_str())
+        let mut s = String::new();
+        s.push('(');
+        s.push_str(msg.as_str());
+        s.push(')');
+
+        ffi::log(&self.logger, level, file, line, func, s.as_str())
     }
 
     fn on_record(&self, _span: &Id, _values: &Record<'_>, _ctx: Context<'_, S>) {
