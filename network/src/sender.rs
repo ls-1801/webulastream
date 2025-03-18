@@ -387,7 +387,7 @@ async fn accept_channel_requests(
     cancellation_token: CancellationToken,
     timeout: Duration,
     active_channel: &mut HashMap<ChannelIdentifier, CancellationToken>,
-    listener: &mut NetworkingConnectionControlListener,
+    listener: NetworkingConnectionControlListener,
 ) -> Option<
     Vec<(
         ChannelIdentifier,
@@ -443,7 +443,7 @@ async fn connection_handler(
     connection_cancellation_token: CancellationToken,
     receiver_addr: SocketAddr,
     controller: NetworkingConnectionController,
-    mut listener: NetworkingConnectionControlListener,
+    listener: NetworkingConnectionControlListener,
 ) -> Result<()> {
     let mut pending_channels: Vec<(
         ChannelIdentifier,
@@ -465,7 +465,7 @@ async fn connection_handler(
             connection_cancellation_token.clone(),
             Duration::from_millis(10),
             &mut active_channel,
-            &mut listener,
+            listener.clone(),
         )
         .await
         {
@@ -499,7 +499,7 @@ async fn connection_handler(
                 connection_cancellation_token.clone(),
                 Duration::from_millis(10),
                 &mut active_channel,
-                &mut listener,
+                listener.clone(),
             )
             .await
             {
