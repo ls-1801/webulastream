@@ -1,4 +1,4 @@
-use std::{thread::sleep, time::Duration, vec};
+use std::vec;
 
 use futures::executor;
 use nes_network::{protocol::TupleBuffer, receiver, sender::{self, ChannelControlMessage}};
@@ -19,8 +19,6 @@ fn start_and_stop_sender() -> Result<(), String> {
     tracing_subscriber::fmt().init();
 
     let service = sender::NetworkService::start(make_rt());
-
-    sleep(Duration::from_secs(10));
 
     service.register_channel(String::from("127.0.0.1:0"), String::from("bar")).map_err(|e| e.to_string())?;
     service.shutdown().map_err(|e| e.to_string())?;
