@@ -22,7 +22,7 @@ pub struct NetworkService {
 
 #[derive(Debug)]
 pub enum NetworkingConnectionControlMessage {
-    RegisterChannel(ChannelIdentifier, oneshot::Sender<ChannelControlQueue>),
+    RegisterChannel(ChannelIdentifier, async_channel::Receiver<ChannelControlMessage>),
     RetryChannel(
         ChannelIdentifier,
         CancellationToken,
@@ -405,14 +405,9 @@ async fn accept_channel_requests(
 
     for request in requests {
         match request {
-            NetworkingConnectionControlMessage::RegisterChannel(channel, response) => {
-                let (sender, queue) = async_channel::bounded(100);
+            NetworkingConnectionControlMessage::RegisterChannel(channel, submission_queue) => {
                 let channel_cancellation = CancellationToken::new();
-                if response.send(sender).is_err() {
-                    warn!("Channel registration was canceled");
-                    continue;
-                }
-                pending.push((channel, channel_cancellation, queue));
+                pending.push((channel, channel_cancellation, submission_queue));
             }
             NetworkingConnectionControlMessage::RetryChannel(
                 active,
@@ -576,7 +571,7 @@ impl NetworkService {
         channel: ChannelIdentifier,
     ) -> Result<channel_handler::ChannelControlQueue> {
         let receiver_addr: SocketAddr = receiver_addr.parse()?;
-        let (tx, rx) = oneshot::channel();
+        let (submission_queue_tx, submission_queue_rx) = async_channel::bounded::<ChannelControlMessage>(100);
 
         let mut connections = self.connections.lock().unwrap();
         let conn_controller = match connections.get(&receiver_addr) {
@@ -601,8 +596,8 @@ impl NetworkService {
             },
             Some((_, tx)) => tx.clone()
         };
-        conn_controller.send_blocking(NetworkingConnectionControlMessage::RegisterChannel(channel, tx))?;
-        rx.blocking_recv().map_err(|_| "Network Service Closed".into())
+        conn_controller.send_blocking(NetworkingConnectionControlMessage::RegisterChannel(channel, submission_queue_rx))?;
+        Ok(submission_queue_tx)
     }
 
     // TODO close channel when query terminated
