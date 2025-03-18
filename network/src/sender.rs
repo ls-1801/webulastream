@@ -27,6 +27,7 @@ enum NetworkingServiceControlMessage {
         oneshot::Sender<ChannelControlQueue>,
     ),
 }
+#[derive(Debug)]
 enum NetworkingConnectionControlMessage {
     RegisterChannel(ChannelIdentifier, oneshot::Sender<ChannelControlQueue>),
     RetryChannel(
