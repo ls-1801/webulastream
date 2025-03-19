@@ -117,6 +117,8 @@ mod channel_handler {
                 }
                 ChannelControlMessage::Terminate => {
                     let _ = self.writer.send(DataChannelRequest::Close).await;
+                    assert!(self.queue.is_empty(), "send queue shall be empty after receiving Terminate!");
+                    self.queue.close();
                     return Err(ChannelHandlerError::Terminated);
                 }
             }
