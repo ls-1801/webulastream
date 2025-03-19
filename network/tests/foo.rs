@@ -1,4 +1,4 @@
-use std::vec;
+use std::{thread::sleep, time::Duration, vec};
 
 use futures::executor;
 use nes_network::{protocol::TupleBuffer, receiver, sender::{self, ChannelControlMessage}};
@@ -45,6 +45,26 @@ fn make_tb(seq_no: u64) -> TupleBuffer {
             data: vec![b'1', b'3', b'1', b'2'],
             child_buffers: Vec::new()
     }
+}
+
+#[test]
+fn register_channel() {
+    console_subscriber::init();
+
+    let conn = String::from("127.0.0.1:13254");
+    let chan = String::from("123");
+
+    let rceivr = receiver::NetworkService::start(make_rt(), conn.clone());
+    let sender = sender::NetworkService::start(make_rt());
+
+    sender.register_channel(conn.clone(), chan.clone()).unwrap();
+    rceivr.register_channel(chan.clone()).unwrap();
+
+    // wait a while so that channel is async-ly opened
+    sleep(Duration::from_millis(100));
+
+    sender.shutdown().unwrap();
+    rceivr.shutdown().unwrap();
 }
 
 #[test]
