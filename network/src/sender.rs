@@ -277,8 +277,6 @@ async fn connection_handler(
     let mut channel_handlers = JoinSet::new();
 
     loop {
-        info!("loop");
-
         let mut retry = 1;
 
         select! {
