@@ -315,6 +315,7 @@ async fn connection_handler(
                             async move {
                                 let chan_res = channel_handler(chan_addr, submissing_queue.clone()).await;
                                 info!("channel handler terminated with {:?}, ordering restart", chan_res);
+                                (channel_id, submissing_queue)
                             }
                         });
                     }
@@ -323,6 +324,11 @@ async fn connection_handler(
                         panic!("not implemented");
                     }
                 }
+            }
+            Some(task) = channel_handlers.join_next() => {
+                let (chan_id, subm_q) = task.unwrap();
+                warn!("channel {} stopped while having submission_queue size {}. Restarting.", chan_id, subm_q.len());
+                controller.send(NetworkingConnectionControlMessage::RegisterChannel(chan_id, subm_q)).await.unwrap();
             }
         }
     }
