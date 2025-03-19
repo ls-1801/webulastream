@@ -274,11 +274,14 @@ async fn connection_handler(
 
     let mut active_channel: HashMap<ChannelIdentifier, AbortHandle> = HashMap::default();
 
+    // JoinSets abort their tasks on drop
     let mut channel_handlers = JoinSet::new();
+    // we abort these because they else might send to closed controller channel
+    let mut retries = JoinSet::new();
 
+    // TODO maybe make retry counter per_channel property
+    let mut retry = 1;
     loop {
-        let mut retry = 1;
-
         select! {
             _ = connection_cancellation_token.cancelled() => { return Ok(()); },
             ctrl_msg = listener.recv() => {
@@ -289,12 +292,18 @@ async fn connection_handler(
                         let connection = match socket.connect(receiver_addr).await {
                             Ok(connection) => connection,
                             Err(e) => {
-                                retry += 1;
                                 warn!("Could not establish connection {}. Retry in {} s", e, retry);
-                                connection_cancellation_token.run_until_cancelled(tokio::time::sleep(Duration::from_secs(1))).await;
+                                let controller = controller.clone();
+                                retries.spawn(async move {
+                                    tokio::time::sleep(Duration::from_secs(retry)).await;
+                                    controller.send(NetworkingConnectionControlMessage::RegisterChannel(channel_id, submissing_queue)).await.unwrap();
+                                });
+                                retry += 1;
                                 continue;
                             }
                         };
+
+                        retry = 1;
 
                         let (mut reader, mut writer) = control_channel_sender(connection);
 
