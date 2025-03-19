@@ -1,7 +1,7 @@
 use crate::protocol::*;
 use futures::SinkExt;
 use tokio::select;
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,8 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub struct NetworkService {
     runtime: Mutex<Option<Runtime>>,
     cancellation_token: CancellationToken,
-    connections: Mutex<HashMap<SocketAddr, (CancellationToken, NetworkingConnectionController)>>,
+    connections: Mutex<HashMap<SocketAddr, (CancellationToken, NetworkingConnectionController, async_channel::Sender<ChannelControlMessage>)>>,
+    join_handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 #[derive(Debug)]
@@ -283,7 +284,11 @@ async fn connection_handler(
     let mut retry = 1;
     loop {
         select! {
-            _ = connection_cancellation_token.cancelled() => { return Ok(()); },
+            _ = connection_cancellation_token.cancelled() => {
+                // wait on all handlers to ensure that they drained their queues.
+                let _ = channel_handlers.join_all();
+                return Ok(());
+            },
             ctrl_msg = listener.recv() => {
                 match ctrl_msg {
                     Err(e) => panic!("broken close_channel or shutdown logic?! Error is {:?}", e),
@@ -355,6 +360,7 @@ impl NetworkService {
             runtime: Mutex::new(Some(runtime)),
             cancellation_token,
             connections: Mutex::new(HashMap::new()),
+            join_handles: Mutex::new(Vec::new()),
         })
     }
 
@@ -375,7 +381,7 @@ impl NetworkService {
                 let mut locked_rt = self.runtime.lock().unwrap();
                 let rt = locked_rt.take().unwrap();
                 // TODO hier JoinSet?
-                rt.spawn({
+                let handle = rt.spawn({
                         let token = token.clone();
                         let receiver_addr = receiver_addr.clone();
                         async move {
@@ -385,18 +391,22 @@ impl NetworkService {
                     }
                 );
                 locked_rt.replace(rt);
-                connections.insert(receiver_addr.clone(), (token, tx.clone()));
+                connections.insert(receiver_addr.clone(), (token, tx.clone(), submission_queue_tx.clone()));
+                self.join_handles.lock().unwrap().push(handle);
                 tx
             },
-            Some((_, tx)) => tx.clone()
+            Some((_, tx, _)) => tx.clone()
         };
         conn_controller.send_blocking(NetworkingConnectionControlMessage::RegisterChannel(channel, submission_queue_rx))?;
         Ok(submission_queue_tx)
     }
 
-    // TODO close channel when query terminated
-
     pub fn shutdown(self: Arc<NetworkService>) -> Result<()> {
+        let connections = self.connections.lock().unwrap();
+        for (_, (_, _, submission_queue)) in connections.iter() {
+            submission_queue.send_blocking(channel_handler::ChannelControlMessage::Terminate).unwrap();
+        }
+
         let runtime = self
             .runtime
             .lock()
@@ -404,6 +414,12 @@ impl NetworkService {
             .take()
             .ok_or("Networking Service was stopped")?;
         self.cancellation_token.cancel();
+
+        // wait until all connection_handlers completely stopped
+        for handle in self.join_handles.lock().unwrap().iter_mut() {
+            runtime.block_on(handle).unwrap();
+        }
+
         thread::sleep(Duration::from_secs(1));
         assert!(runtime.metrics().num_alive_tasks() == 0);
         runtime.shutdown_timeout(Duration::from_secs(1));
