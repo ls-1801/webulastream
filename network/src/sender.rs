@@ -57,7 +57,6 @@ mod channel_handler {
     use tokio::select;
     use tokio::sync::oneshot;
     use tokio_stream::StreamExt;
-    use tokio_util::sync::CancellationToken;
     use tracing::{info, trace, warn};
 
     const MAX_PENDING_ACKS: usize = 64;
@@ -77,7 +76,6 @@ mod channel_handler {
         Terminated,
     }
     pub(super) struct ChannelHandler {
-        cancellation_token: CancellationToken,
         pending_writes: VecDeque<TupleBuffer>,
         wait_for_ack: HashMap<u64, TupleBuffer>,
         writer: DataChannelSenderWriter,
@@ -89,14 +87,12 @@ mod channel_handler {
 
     impl ChannelHandler {
         pub fn new(
-            cancellation_token: CancellationToken,
             stream: TcpStream,
             queue: ChannelControlQueueListener,
         ) -> Self {
             let (reader, writer) = protocol::data_channel_sender(stream);
 
             Self {
-                cancellation_token,
                 pending_writes: Default::default(),
                 wait_for_ack: Default::default(),
                 reader,
@@ -181,18 +177,12 @@ mod channel_handler {
                     .flush()
                     .await
                     .map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?;
-                if self.cancellation_token.is_cancelled() {
-                    return Err(ChannelHandlerError::Cancelled);
-                }
-
                 if self.pending_writes.is_empty() || self.wait_for_ack.len() >= MAX_PENDING_ACKS {
                     select! {
-                        _ = self.cancellation_token.cancelled() => {return Err(ChannelHandlerError::Cancelled);},
                         response = self.reader.next() => self.handle_response(response.ok_or(ChannelHandlerError::ClosedByOtherSide)?.map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?)?,
                     }
                 } else {
                     select! {
-                        _ = self.cancellation_token.cancelled() => {return Err(ChannelHandlerError::Cancelled);},
                         response = self.reader.next() => self.handle_response(response.ok_or(ChannelHandlerError::ClosedByOtherSide)?.map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?)?,
                         send_result = Self::send_pending(&mut self.writer, &mut self.pending_writes, &mut self.wait_for_ack) => send_result?,
                     }
@@ -204,19 +194,13 @@ mod channel_handler {
 
         pub(super) async fn run(&mut self) -> Result<()> {
             loop {
-                if self.cancellation_token.is_cancelled() {
-                    return Err(ChannelHandlerError::Cancelled);
-                }
-
                 if self.pending_writes.is_empty() || self.wait_for_ack.len() >= MAX_PENDING_ACKS {
                     select! {
-                        _ = self.cancellation_token.cancelled() => {return Err(ChannelHandlerError::Cancelled);},
                         response = self.reader.next() => self.handle_response(response.ok_or(ChannelHandlerError::ClosedByOtherSide)?.map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?)?,
                         request = self.queue.recv() => self.handle_request(request.map_err(|_| ChannelHandlerError::Cancelled)?).await?,
                     }
                 } else {
                     select! {
-                        _ = self.cancellation_token.cancelled() => {return Err(ChannelHandlerError::Cancelled);},
                         response = self.reader.next() => self.handle_response(response.ok_or(ChannelHandlerError::ClosedByOtherSide)?.map_err(|e| ChannelHandlerError::ConnectionLost(e.into()))?)?,
                         request = self.queue.recv() => self.handle_request(request.map_err(|_| ChannelHandlerError::Cancelled)?).await?,
                         send_result = Self::send_pending(&mut self.writer, &mut self.pending_writes, &mut self.wait_for_ack) => send_result?,
@@ -229,7 +213,6 @@ mod channel_handler {
 
 
 async fn channel_handler(
-    cancellation_token: CancellationToken,
     channel_address: SocketAddr,
     queue: channel_handler::ChannelControlQueueListener,
 ) -> ChannelHandlerResult {
@@ -242,16 +225,12 @@ async fn channel_handler(
         }
     };
 
-    let connection = match cancellation_token
-        .run_until_cancelled(socket.connect(channel_address))
-        .await
-    {
-        None => return ChannelHandlerResult::Cancelled,
-        Some(Err(e)) => return ChannelHandlerResult::ConnectionLost(e.into()),
-        Some(Ok(connection)) => connection,
+    let connection = match socket.connect(channel_address).await {
+        Err(e) => return ChannelHandlerResult::ConnectionLost(e.into()),
+        Ok(connection) => connection,
     };
 
-    let mut handler = channel_handler::ChannelHandler::new(cancellation_token, connection, queue);
+    let mut handler = channel_handler::ChannelHandler::new(connection, queue);
     match handler.run().await {
         Ok(_) => ChannelHandlerResult::Closed,
         Err(channel_handler::ChannelHandlerError::Terminated) => ChannelHandlerResult::Closed,
@@ -332,12 +311,11 @@ async fn connection_handler(
                             }
                         };
 
-                        let chan_canceler = CancellationToken::new();
                         let chan_addr = SocketAddr::new(receiver_addr.ip(), port);
 
                         let aborter = channel_handlers.spawn({
                             async move {
-                                let chan_res = channel_handler(chan_canceler, chan_addr, submissing_queue.clone()).await;
+                                let chan_res = channel_handler(chan_addr, submissing_queue.clone()).await;
                                 info!("channel handler terminated with {:?}, ordering restart", chan_res);
                             }
                         });
