@@ -689,7 +689,7 @@ impl NetworkService {
             .take()
             .ok_or("Networking Service was stopped")?;
         self.cancellation_token.cancel();
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(1));
         assert!(runtime.metrics().num_alive_tasks() == 0);
         runtime.shutdown_timeout(Duration::from_secs(1));
         Ok(())
