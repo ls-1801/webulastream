@@ -67,6 +67,47 @@ fn register_channel() {
     rceivr.shutdown().unwrap();
 }
 
+// pub struct VecWriter { buffer: Vec<String> }
+// 
+// impl VecWriter {
+//     pub fn new() -> Self { VecWriter { buffer: Vec::new() } }
+//     pub fn get_buffer(&self) -> &Vec<String> { &self.buffer }
+// }
+// 
+// impl Write for VecWriter {
+//     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+//         let s = buf.escape_ascii().to_string();
+//         self.buffer.push(s);
+//         Ok(buf.len())
+//     }
+// 
+//     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+// }
+
+#[test]
+fn sender_register_channel_retry() {
+
+    // TODO add layer with writer that checks if retry in 2 secs was printed
+    //
+    // let layer = tracing_subscriber::fmt::Layer::default()
+    //     .with_writer(VecWriter::new);
+    // tracing_subscriber::Registry::default().with(layer);
+
+
+    let conn = String::from("127.0.0.1:13254");
+    let chan = String::from("123");
+
+    let sender = sender::NetworkService::start(make_rt());
+
+    sender.register_channel(conn.clone(), chan.clone()).unwrap();
+
+    sleep(Duration::from_secs(5));
+
+    let rceivr = receiver::NetworkService::start(make_rt(), conn.clone());
+    sender.shutdown().unwrap();
+    rceivr.shutdown().unwrap();
+}
+
 #[test]
 fn send_and_receive() {
     tracing_subscriber::fmt().init();
