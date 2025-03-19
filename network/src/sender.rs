@@ -254,8 +254,6 @@ async fn connection_handler(
     listener: NetworkingConnectionControlListener,
 ) -> Result<()> {
 
-    let mut active_channel: HashMap<ChannelIdentifier, AbortHandle> = HashMap::default();
-
     // JoinSets abort their tasks on drop
     let mut channel_handlers = JoinSet::new();
     // we abort these because they else might send to closed controller channel
@@ -313,14 +311,12 @@ async fn connection_handler(
 
                         let chan_addr = SocketAddr::new(receiver_addr.ip(), port);
 
-                        let aborter = channel_handlers.spawn({
+                        channel_handlers.spawn({
                             async move {
                                 let chan_res = channel_handler(chan_addr, submissing_queue.clone()).await;
                                 info!("channel handler terminated with {:?}, ordering restart", chan_res);
                             }
                         });
-
-                        active_channel.insert(channel_id.clone(), aborter);
                     }
 
                     Ok(NetworkingConnectionControlMessage::RetryChannel(_, _, _)) => {
