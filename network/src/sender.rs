@@ -1,5 +1,7 @@
 use crate::protocol::*;
 use futures::SinkExt;
+use tokio::select;
+use tokio::task::{AbortHandle, JoinSet};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -35,6 +37,7 @@ type NetworkingConnectionController = async_channel::Sender<NetworkingConnection
 type NetworkingConnectionControlListener =
     async_channel::Receiver<NetworkingConnectionControlMessage>;
 
+#[derive(Debug)]
 enum ChannelHandlerResult {
     Cancelled,
     ConnectionLost(Box<dyn std::error::Error + Send + Sync>),
@@ -425,7 +428,7 @@ async fn accept_channel_requests(
 
 /// runs for connection to one other node
 /// might manage multiple channels
-async fn connection_handler(
+async fn connection_handler_1(
     connection_cancellation_token: CancellationToken,
     receiver_addr: SocketAddr,
     controller: NetworkingConnectionController,
@@ -554,6 +557,81 @@ async fn connection_handler(
     }
 }
 
+async fn connection_handler(
+    connection_cancellation_token: CancellationToken,
+    receiver_addr: SocketAddr,
+    controller: NetworkingConnectionController,
+    listener: NetworkingConnectionControlListener,
+) -> Result<()> {
+
+    let mut active_channel: HashMap<ChannelIdentifier, AbortHandle> = HashMap::default();
+
+    let mut channel_handlers = JoinSet::new();
+
+    loop {
+        info!("loop");
+
+        let mut retry = 1;
+
+        select! {
+            _ = connection_cancellation_token.cancelled() => { return Ok(()); },
+            ctrl_msg = listener.recv() => {
+                match ctrl_msg {
+                    Err(e) => panic!("broken close_channel or shutdown logic?! Error is {:?}", e),
+                    Ok(NetworkingConnectionControlMessage::RegisterChannel(channel_id, submissing_queue)) => {
+                        let socket = TcpSocket::new_v4()?;
+                        let connection = match socket.connect(receiver_addr).await {
+                            Ok(connection) => connection,
+                            Err(e) => {
+                                retry += 1;
+                                warn!("Could not establish connection {}. Retry in {} s", e, retry);
+                                connection_cancellation_token.run_until_cancelled(tokio::time::sleep(Duration::from_secs(1))).await;
+                                continue;
+                            }
+                        };
+
+                        let (mut reader, mut writer) = control_channel_sender(connection);
+
+                        if let Err(e) = writer.send(ControlChannelRequest::ChannelRequest(channel_id.clone())).await {
+                            warn!("Could not send channel creation request: {}", e);
+                            continue;
+                        }
+
+                        let port = match reader.next().await {
+                            Some(Ok(ControlChannelResponse::OkChannelResponse(port))) => port,
+                            Some(Ok(ControlChannelResponse::DenyChannelResponse)) => panic!("why deny?!"),
+                            Some(Err(e)) => {
+                                warn!("Error receiving port from receiver node: {}", e);
+                                continue;
+                            },
+                            None => {
+                                warn!("connection to receiver node closed.");
+                                continue;
+                            }
+                        };
+
+                        let chan_canceler = CancellationToken::new();
+                        let chan_addr = SocketAddr::new(receiver_addr.ip(), port);
+
+                        let aborter = channel_handlers.spawn({
+                            async move {
+                                let chan_res = channel_handler(chan_canceler, chan_addr, submissing_queue.clone()).await;
+                                info!("channel handler terminated with {:?}, ordering restart", chan_res);
+                            }
+                        });
+
+                        active_channel.insert(channel_id.clone(), aborter);
+                    }
+
+                    Ok(NetworkingConnectionControlMessage::RetryChannel(_, _, _)) => {
+                        panic!("not implemented");
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl NetworkService {
     pub fn start(runtime: Runtime) -> Arc<NetworkService> {
         let cancellation_token = CancellationToken::new();
@@ -581,6 +659,7 @@ impl NetworkService {
                 let token = self.cancellation_token.clone();
                 let mut locked_rt = self.runtime.lock().unwrap();
                 let rt = locked_rt.take().unwrap();
+                // TODO hier JoinSet?
                 rt.spawn({
                         let token = token.clone();
                         let receiver_addr = receiver_addr.clone();

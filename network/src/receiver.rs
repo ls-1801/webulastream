@@ -194,19 +194,19 @@ async fn control_socket_handler(
     stream: TcpStream,
     channels: RegisteredChannels,
     control: NetworkingServiceController,
-) -> Result<ControlChannelRequest> {
+)  {
     let (mut reader, mut writer) = control_channel_receiver(stream);
     let mut active_connection_channels = vec![];
     loop {
         let Some(Ok(message)) = reader.next().await else {
-            warn!(
-                "Connection was closed. Cancelling {} channel(s)",
-                active_connection_channels.len()
-            );
-            active_connection_channels
-                .into_iter()
-                .for_each(|t: CancellationToken| t.cancel());
-            return Err("Connection Closed".into());
+            // warn!(
+            //     "Connection was closed. Cancelling {} channel(s)",
+            //     active_connection_channels.len()
+            // );
+            // active_connection_channels
+            //     .into_iter()
+            //     .for_each(|t: CancellationToken| t.cancel());
+            return;
         };
 
         match message {
@@ -215,15 +215,18 @@ async fn control_socket_handler(
                 let Some((emit, token)) = channels.write().await.remove(&channel) else {
                     writer
                         .send(ControlChannelResponse::DenyChannelResponse)
-                        .await?;
+                        .await;
                     continue;
                 };
 
-                let port =
-                    create_channel_handler(channel, emit, token.clone(), control.clone()).await?;
+                let Ok(port) =
+                    create_channel_handler(channel, emit, token.clone(), control.clone()).await
+                else {
+                    return;
+                };
                 writer
                     .send(ControlChannelResponse::OkChannelResponse(port))
-                    .await?;
+                    .await;
                 active_connection_channels.push(token);
             }
         }
