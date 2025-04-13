@@ -96,6 +96,7 @@ fn init_sender_server() {
             .worker_threads(2)
             .enable_io()
             .enable_time()
+            .worker_threads(2)
             .build()
             .unwrap();
         sender::NetworkService::start(rt)
@@ -107,6 +108,7 @@ fn init_receiver_server(connection_identifier: ConnectionIdentifier) {
             .thread_name("net-sender")
             .worker_threads(2)
             .enable_io()
+            .worker_threads(2)
             .enable_time()
             .build()
             .unwrap();
