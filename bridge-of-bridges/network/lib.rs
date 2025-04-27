@@ -46,8 +46,9 @@ pub mod ffi {
             server: &mut ReceiverServer,
             channel_identifier: String,
         ) -> Box<ReceiverChannel>;
+        fn interrupt_receiver(receiver_channel: &ReceiverChannel) -> bool;
         fn receive_buffer(
-            receiver_channel: &mut ReceiverChannel,
+            receiver_channel: &ReceiverChannel,
             builder: Pin<&mut TupleBufferBuilder>,
         ) -> bool;
 
@@ -147,8 +148,12 @@ fn register_receiver_channel(
     })
 }
 
+fn interrupt_receiver(receiver_channel: &ReceiverChannel) -> bool {
+    receiver_channel.data_queue.close()
+}
+
 fn receive_buffer(
-    receiver_channel: &mut ReceiverChannel,
+    receiver_channel: &ReceiverChannel,
     mut builder: Pin<&mut ffi::TupleBufferBuilder>,
 ) -> bool {
     let Ok(buffer) = receiver_channel.data_queue.recv_blocking() else {
