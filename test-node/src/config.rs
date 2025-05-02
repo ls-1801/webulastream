@@ -28,11 +28,13 @@ pub enum Command {
     StopQuery { id: usize },
     Wait { millis: usize },
 }
+
 #[derive(Deserialize, Serialize)]
 pub struct Node {
     pub(crate) connection: ConnectionIdentifier,
     pub commands: Vec<Command>,
 }
+
 pub(crate) fn load_config(file: &std::path::Path, index: usize) -> Node {
     let file = std::fs::File::open(file).unwrap();
     let mut nodes: Vec<Node> = serde_yaml::from_reader(&file).unwrap();

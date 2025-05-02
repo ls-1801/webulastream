@@ -13,7 +13,7 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, info_span, warn, Instrument, Span};
 
-pub struct NetworkService {
+pub struct ReceiverNetworkService {
     sender: NetworkingServiceController,
     runtime: Mutex<Option<Runtime>>,
 }
@@ -270,13 +270,13 @@ async fn control_socket(
         }
     }
 }
-impl NetworkService {
+impl ReceiverNetworkService {
     pub fn start(
         runtime: Runtime,
         connection_identifier: ConnectionIdentifier,
-    ) -> Arc<NetworkService> {
+    ) -> Arc<ReceiverNetworkService> {
         let (tx, rx) = async_channel::bounded(10);
-        let service = Arc::new(NetworkService {
+        let service = Arc::new(ReceiverNetworkService {
             sender: tx.clone(),
             runtime: Mutex::new(Some(runtime)),
         });
@@ -309,7 +309,7 @@ impl NetworkService {
     }
 
     pub fn register_channel(
-        self: &Arc<NetworkService>,
+        self: &Arc<ReceiverNetworkService>,
         channel: ChannelIdentifier,
     ) -> Result<async_channel::Receiver<TupleBuffer>> {
         let (data_queue_sender, data_queue_receiver) = async_channel::bounded(10);
@@ -329,7 +329,7 @@ impl NetworkService {
         Ok(data_queue_receiver)
     }
 
-    pub fn shutdown(self: Arc<NetworkService>) -> Result<()> {
+    pub fn shutdown(self: Arc<ReceiverNetworkService>) -> Result<()> {
         self.sender.close();
         let runtime = self
             .runtime

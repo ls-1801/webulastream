@@ -1,7 +1,8 @@
 use async_channel::TrySendError;
 use nes_network::protocol::{ConnectionIdentifier, TupleBuffer};
-use nes_network::sender::{ChannelControlMessage, ChannelControlQueue};
-use nes_network::*;
+use nes_network::receiver::receiver::ReceiverNetworkService;
+use nes_network::sender::data_channel_handler::{ChannelControlMessage, ChannelControlQueue};
+use nes_network::sender::network_service::SenderNetworkService;
 use once_cell::sync;
 use std::error::Error;
 use std::pin::Pin;
@@ -73,14 +74,14 @@ pub mod ffi {
     }
 }
 
-static RECEIVER: sync::OnceCell<Arc<receiver::NetworkService>> = sync::OnceCell::new();
-static SENDER: sync::OnceCell<Arc<sender::NetworkService>> = sync::OnceCell::new();
+static RECEIVER: sync::OnceCell<Arc<ReceiverNetworkService>> = sync::OnceCell::new();
+static SENDER: sync::OnceCell<Arc<SenderNetworkService>> = sync::OnceCell::new();
 
 pub struct ReceiverServer {
-    handle: Arc<receiver::NetworkService>,
+    handle: Arc<ReceiverNetworkService>,
 }
 struct SenderServer {
-    handle: Arc<sender::NetworkService>,
+    handle: Arc<SenderNetworkService>,
 }
 struct SenderChannel {
     data_queue: ChannelControlQueue,
@@ -100,7 +101,7 @@ fn init_sender_server() {
             .worker_threads(2)
             .build()
             .unwrap();
-        sender::NetworkService::start(rt)
+        SenderNetworkService::start(rt)
     });
 }
 fn init_receiver_server(connection_identifier: ConnectionIdentifier) {
@@ -113,7 +114,7 @@ fn init_receiver_server(connection_identifier: ConnectionIdentifier) {
             .enable_time()
             .build()
             .unwrap();
-        receiver::NetworkService::start(rt, connection_identifier)
+        ReceiverNetworkService::start(rt, connection_identifier)
     });
 }
 
