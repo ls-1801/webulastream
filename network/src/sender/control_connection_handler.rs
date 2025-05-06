@@ -12,9 +12,9 @@ use crate::sender::network_service::{Error, Result};
 use futures::SinkExt;
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, info_span, warn};
@@ -40,14 +40,14 @@ impl Cancellable for CancellationToken {
 }
 
 // Establishes a data channel with the receiver host over the control connection.
-// Uses a request-response pattern, i.e., we do not return from this method until we have received 
-// a response or an error/cancellation occurred. 
+// Uses a request-response pattern, i.e., we do not return from this method until we have received
+// a response or an error/cancellation occurred.
 // Failed attempts will return an EstablishChannelResult that indicates the cause of the failure,
 // leading to a retry or cancellation of the channel.
 async fn establish_channel(
     control_channel_sender_writer: &mut ControlChannelSenderWriter,
     control_channel_sender_reader: &mut ControlChannelSenderReader,
-    connection_identifier: &ConnectionIdentifier,
+    connection_id: &ConnectionIdentifier,
     channel: ChannelIdentifier,
     channel_cancellation_token: CancellationToken,
     queue: data_channel_handler::ChannelControlQueueListener,
@@ -84,12 +84,32 @@ async fn establish_channel(
             None => return EstablishChannelResult::BadConnection(channel, queue, "Connection closed".into()),
         }
     };
-    info!("Creation of data channel accepted by remote node. Using port '{:?}'", port);
+    info!(
+        "Creation of data channel accepted by remote node. Using port '{:?}'",
+        port
+    );
 
     // At this point, we know that the receiving side is ready to accept data via the channel
-    let channel_address = connection_identifier.parse::<SocketAddr>()
-        .expect("The Connection identifier should not be an invalid address, as the connection should have already been established");
-    let channel_address = SocketAddr::new(channel_address.ip(), port);
+    let socket_addr = match lookup_host(connection_id).await {
+        Ok(mut addr_iter) => match addr_iter.next() {
+            Some(addr) => addr,
+            None => {
+                return EstablishChannelResult::BadConnection(
+                    channel,
+                    queue,
+                    "Could not resolve connection identifier.".into(),
+                );
+            }
+        },
+        Err(_) => {
+            return EstablishChannelResult::BadConnection(
+                channel,
+                queue,
+                "Could not resolve connection identifier. DNS Lookup failed.".into(),
+            );
+        }
+    };
+    let channel_address = SocketAddr::new(socket_addr.ip(), port);
 
     // spawn a task to handle the data channel
     tokio::spawn(
@@ -201,8 +221,12 @@ async fn establish_control_connection(
             Ok(s) => s,
             Err(_) => return None,
         };
-        let socket_addr = match connection_id.parse::<SocketAddr>() {
-            Ok(addr) => addr,
+
+        let socket_addr = match lookup_host(connection_id).await {
+            Ok(mut addr_iter) => match addr_iter.next() {
+                Some(addr) => addr,
+                None => return None,
+            },
             Err(_) => return None,
         };
 
