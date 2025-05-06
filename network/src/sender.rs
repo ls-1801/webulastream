@@ -1,7 +1,7 @@
 use crate::protocol::*;
 use futures::SinkExt;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpSocket;
@@ -335,7 +335,15 @@ async fn establish_channel(
         None => return EstablishChannelResult::Cancelled,
     };
 
-    let channel_address = connection_identifier.parse::<SocketAddr>().expect("The Connection identifier should not be an invalid address, as the connection should have already been established");
+    let channel_address = connection_identifier.to_socket_addrs();
+    let Ok(mut channel_address) = channel_address else {
+        return EstablishChannelResult::BadConnection(channel, queue, "Could not resolve connection identifier. DNS Lookup failed.".into())
+    };
+
+    let Some(channel_address) = channel_address.next() else {
+        return EstablishChannelResult::BadConnection(channel, queue, "Could not resolve connection identifier".into())
+    };
+
     let channel_address = SocketAddr::new(channel_address.ip(), port);
 
     tokio::spawn(
@@ -470,8 +478,11 @@ async fn connection_handler(
         }
 
         let socket = TcpSocket::new_v4()?;
+
+        let connection_address = connection_identifier.to_socket_addrs().map_err(|_| "Failed to to DNS Lookup")?.next();
+        let connection_address = connection_address.ok_or("Could not resolve connection identifier")?;
         let connection = match connection_cancellation_token
-            .run_until_cancelled(socket.connect(connection_identifier.parse()?))
+            .run_until_cancelled(socket.connect(connection_address))
             .await
         {
             None => return on_cancel(active_channel),
