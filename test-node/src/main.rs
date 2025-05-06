@@ -1,22 +1,23 @@
 mod config;
 mod engine;
 
-use crate::receiver::receiver::ReceiverNetworkService;
 use crate::config::Command;
 use crate::engine::{
     EmitFn, ExecutablePipeline, Node, PipelineContext, Query, QueryEngine, SourceImpl, SourceNode,
 };
+use crate::receiver::receiver::ReceiverNetworkService;
 use async_channel::TrySendError;
 use bytes::{Buf, BufMut, BytesMut};
 use clap::{Parser, Subcommand};
+use log::error;
 use nes_network::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
 use nes_network::sender::data_channel_handler::ChannelControlMessage;
-use nes_network::{receiver, sender};
 use nes_network::sender::network_service::SenderNetworkService;
-use log::error;
+use nes_network::{receiver, sender};
+use std::cell::OnceCell;
 use std::collections::{HashSet, VecDeque};
-use std::io::prelude::*;
 use std::io::Cursor;
+use std::io::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -560,6 +561,40 @@ fn bridge(
     query
 }
 
+fn lazy_init_sender(sender: &OnceCell<Arc<SenderNetworkService>>) -> Arc<SenderNetworkService> {
+    sender
+        .get_or_init(|| {
+            SenderNetworkService::start(
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_name("sender")
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .unwrap(),
+            )
+        })
+        .clone()
+}
+
+fn lazy_init_receiver(
+    receiver: &OnceCell<Arc<ReceiverNetworkService>>,
+    connection_id: ConnectionIdentifier,
+) -> Arc<ReceiverNetworkService> {
+    receiver
+        .get_or_init(|| {
+            ReceiverNetworkService::start(
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_name("receiver")
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .unwrap(),
+                connection_id,
+            )
+        })
+        .clone()
+}
+
 fn main() {
     tracing_subscriber::fmt().init();
     let args = CLIArgs::parse();
@@ -567,21 +602,8 @@ fn main() {
     let config = config::load_config(std::path::Path::new(&args.file), args.index);
 
     let engine = QueryEngine::start();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("sender")
-        .enable_io()
-        .enable_time()
-        .build()
-        .unwrap();
-    let sender = SenderNetworkService::start(rt);
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("receiver")
-        .enable_io()
-        .enable_time()
-        .build()
-        .unwrap();
-    let receiver = ReceiverNetworkService::start(rt, config.connection);
+    let sender: OnceCell<Arc<SenderNetworkService>> = OnceCell::new();
+    let receiver: OnceCell<Arc<ReceiverNetworkService>> = OnceCell::new();
 
     for command in config.commands.into_iter() {
         match command {
@@ -595,7 +617,7 @@ fn main() {
                         downstream_connection,
                         downstream_channel,
                         ingestion_rate_in_milliseconds,
-                        sender.clone(),
+                        lazy_init_sender(&sender),
                         engine.clone(),
                     ),
                     config::Query::Bridge {
@@ -609,8 +631,8 @@ fn main() {
                         downstream_connection,
                         ingestion_rate_in_milliseconds,
                         engine.clone(),
-                        receiver.clone(),
-                        sender.clone(),
+                        lazy_init_receiver(&receiver, config.connection.clone()),
+                        lazy_init_sender(&sender),
                     ),
                     config::Query::Sink {
                         input_channel,
@@ -619,7 +641,7 @@ fn main() {
                         input_channel,
                         ingestion_rate_in_milliseconds,
                         engine.clone(),
-                        receiver.clone(),
+                        lazy_init_receiver(&receiver, config.connection.clone()),
                     ),
                 };
             }
