@@ -12,7 +12,7 @@ use crate::sender::network_service::{Error, Result};
 use futures::SinkExt;
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::select;
@@ -44,7 +44,7 @@ impl Cancellable for CancellationToken {
 // a response or an error/cancellation occurred.
 // Failed attempts will return an EstablishChannelResult that indicates the cause of the failure,
 // leading to a retry or cancellation of the channel.
-async fn establish_channel(
+async fn establish_data_channel(
     control_channel_sender_writer: &mut ControlChannelSenderWriter,
     control_channel_sender_reader: &mut ControlChannelSenderReader,
     connection_id: &ConnectionIdentifier,
@@ -53,7 +53,7 @@ async fn establish_channel(
     queue: data_channel_handler::ChannelControlQueueListener,
     controller: ConnectionController,
 ) -> EstablishChannelResult {
-    // send a data channel creation request, continue if success, return if canceled/error
+    // Send a data channel creation request, continue if success, return if canceled/error
     select! {
         _ = channel_cancellation_token.cancelled() => {
             return EstablishChannelResult::Cancelled;
@@ -84,10 +84,7 @@ async fn establish_channel(
             None => return EstablishChannelResult::BadConnection(channel, queue, "Connection closed".into()),
         }
     };
-    info!(
-        "Creation of data channel accepted by remote node. Using port '{:?}'",
-        port
-    );
+    info!("Creation of data channel accepted by remote node. Using port '{port:?}'");
 
     // At this point, we know that the receiving side is ready to accept data via the channel
     let socket_addr = match lookup_host(connection_id).await {
@@ -117,7 +114,7 @@ async fn establish_channel(
             let channel = channel.clone();
             let channel_cancellation_token = channel_cancellation_token.clone();
             async move {
-                match data_channel_handler::channel_handler(
+                match data_channel_handler::data_channel_handler(
                     channel_cancellation_token.clone(),
                     channel_address,
                     queue.clone(),
@@ -156,7 +153,7 @@ async fn establish_channel(
     EstablishChannelResult::Ok(channel_cancellation_token)
 }
 
-async fn accept_channel_requests(
+async fn accept_data_channel_requests(
     cancellation_token: CancellationToken,
     timeout: Duration,
     active_channels: &mut HashMap<ChannelIdentifier, CancellationToken>,
@@ -211,7 +208,7 @@ async fn accept_channel_requests(
     Some(pending)
 }
 
-async fn establish_control_connection(
+async fn establish_control_channel(
     connection_id: &ConnectionIdentifier,
     cancellation_token: &CancellationToken,
 ) -> Option<TcpStream> {
@@ -249,7 +246,7 @@ async fn establish_control_connection(
     }
 }
 
-async fn handle_pending_channels(
+async fn handle_pending_data_channels(
     pending_channels: Vec<(
         ChannelIdentifier,
         CancellationToken,
@@ -282,7 +279,7 @@ async fn handle_pending_channels(
         }
 
         match connection_cancellation_token
-            .run_until_cancelled(establish_channel(
+            .run_until_cancelled(establish_data_channel(
                 sender_writer,
                 sender_reader,
                 connection_id,
@@ -318,7 +315,7 @@ async fn handle_pending_channels(
 // 3. Handles these requests by negotiating over the previously created control connection
 // 4. Holds and maintains the state of all active and pending data channels (connections) between us and the receiver host
 // In general, the sender side (we) initiate the connection, creating an upstream --> downstream flow of information
-pub(crate) async fn connection_handler(
+pub(crate) async fn control_channel_handler(
     connection_id: ConnectionIdentifier,
     connection_cancellation_token: CancellationToken,
     controller: ConnectionController,
@@ -337,7 +334,7 @@ pub(crate) async fn connection_handler(
     'connection: loop {
         // 1. establish control connection
         let Some(connection) =
-            establish_control_connection(&connection_id, &connection_cancellation_token).await
+            establish_control_channel(&connection_id, &connection_cancellation_token).await
         else {
             // Cancellation of the connection handler was requested, cancel all active channels and exit
             return cancel_all(active_data_channels);
@@ -349,7 +346,7 @@ pub(crate) async fn connection_handler(
         // The only reason to exit this loop is when the control connection is lost
         loop {
             // TODO: set limit to number of pending channels?
-            if let Some(mut new_pending_channels) = accept_channel_requests(
+            if let Some(mut new_pending_channels) = accept_data_channel_requests(
                 connection_cancellation_token.clone(),
                 Duration::from_millis(10),
                 &mut active_data_channels,
@@ -362,7 +359,7 @@ pub(crate) async fn connection_handler(
                 return cancel_all(active_data_channels);
             }
 
-            let (updated_pending_channels, control_connection_failure) = handle_pending_channels(
+            let (updated_pending_channels, control_connection_failure) = handle_pending_data_channels(
                 pending_data_channels,
                 &mut active_data_channels,
                 &connection_id,

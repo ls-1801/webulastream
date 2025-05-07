@@ -1,6 +1,6 @@
 use crate::protocol::{ChannelIdentifier, ConnectionIdentifier};
 use crate::sender::cancellation::{Cancellable, cancel_all};
-use crate::sender::control_connection_handler::connection_handler;
+use crate::sender::control_channel_handler::control_channel_handler;
 use crate::sender::data_channel_handler::{ChannelControlQueue, ChannelControlQueueListener};
 use crate::sender::network_service;
 use crate::sender::network_service::Result;
@@ -46,7 +46,7 @@ pub(crate) async fn network_sender_dispatcher(
         {
             None => return cancel_all(connections),
             Some(Err(_)) => return Err("Queue was closed".into()),
-            Some(Ok(network_service::ControlMessage::RegisterChannel(
+            Some(Ok(network_service::NetworkServiceControlMessage::RegisterChannel(
                 connection_id,
                 channel_id,
                 tx,
@@ -55,7 +55,7 @@ pub(crate) async fn network_sender_dispatcher(
                 // Create a new connection if it does not exist yet
                 if !connections.contains_key(&connection_id) {
                     match cancellation_token
-                        .run_until_cancelled(create_connection(&connection_id))
+                        .run_until_cancelled(create_control_channel(&connection_id))
                         .await
                     {
                         // When control resumes here, we have a new connection, a failure, or cancellation occurred
@@ -99,7 +99,7 @@ pub(crate) async fn network_sender_dispatcher(
 // responsible for establishing a control connection to a remote node
 // receives a host:port pair and returns a connection controller with an associated cancellation token
 // the connection controller is a sender handle to
-async fn create_connection(
+async fn create_control_channel(
     connection_id: &ConnectionIdentifier,
 ) -> Result<(CancellationToken, ConnectionController)> {
     let cancellation_token = CancellationToken::new();
@@ -119,7 +119,7 @@ async fn create_connection(
             async move {
                 info!(
                     "Connection is terminated: {:?}",
-                    connection_handler(
+                    control_channel_handler(
                         connection,
                         connection_cancellation_token,
                         controller_clone,

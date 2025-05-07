@@ -14,7 +14,7 @@ pub(crate) type Error = Box<dyn std::error::Error + Send + Sync>;
 // Instruct the network service to create a new network channel
 // The first message will lead to establishment of a control connection to the remote host
 // identified by the ConnectionIdentifier
-pub(crate) enum ControlMessage {
+pub(crate) enum NetworkServiceControlMessage {
     RegisterChannel(
         ConnectionIdentifier,
         ChannelIdentifier,
@@ -23,8 +23,8 @@ pub(crate) enum ControlMessage {
 }
 
 // Controller will send RegisterChannel requests, ControlListener will rcv and react on them
-type Controller = async_channel::Sender<ControlMessage>;
-pub(crate) type ControlListener = async_channel::Receiver<ControlMessage>;
+type Controller = async_channel::Sender<NetworkServiceControlMessage>;
+pub(crate) type ControlListener = async_channel::Receiver<NetworkServiceControlMessage>;
 
 // Handle networking for the given node as the "sender" to downstream nodes
 pub struct SenderNetworkService {
@@ -71,7 +71,7 @@ impl SenderNetworkService {
         let (tx, rx) = oneshot::channel();
         let Ok(_) = self
             .controller
-            .send_blocking(ControlMessage::RegisterChannel(connection, channel, tx))
+            .send_blocking(NetworkServiceControlMessage::RegisterChannel(connection, channel, tx))
         else {
             return Err("Network Service Closed".into());
         };

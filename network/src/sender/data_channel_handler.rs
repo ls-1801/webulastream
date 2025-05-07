@@ -210,7 +210,7 @@ impl ChannelHandler {
     }
 }
 
-pub(crate) async fn channel_handler(
+pub(crate) async fn data_channel_handler(
     cancellation_token: CancellationToken,
     channel_address: SocketAddr,
     queue: ChannelControlQueueListener,
