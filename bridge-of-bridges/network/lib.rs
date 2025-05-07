@@ -1,6 +1,6 @@
 use async_channel::TrySendError;
 use nes_network::protocol::{ConnectionIdentifier, TupleBuffer};
-use nes_network::receiver::receiver::ReceiverNetworkService;
+use nes_network::receiver::network_service::ReceiverNetworkService;
 use nes_network::sender::data_channel_handler::{ChannelControlMessage, ChannelControlQueue};
 use nes_network::sender::network_service::SenderNetworkService;
 use once_cell::sync;

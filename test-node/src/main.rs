@@ -5,15 +5,15 @@ use crate::config::Command;
 use crate::engine::{
     EmitFn, ExecutablePipeline, Node, PipelineContext, Query, QueryEngine, SourceImpl, SourceNode,
 };
-use crate::receiver::receiver::ReceiverNetworkService;
 use async_channel::TrySendError;
 use bytes::{Buf, BufMut, BytesMut};
 use clap::{Parser, Subcommand};
 use log::error;
 use nes_network::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
+use nes_network::receiver::network_service::ReceiverNetworkService;
+use nes_network::sender;
 use nes_network::sender::data_channel_handler::ChannelControlMessage;
 use nes_network::sender::network_service::SenderNetworkService;
-use nes_network::{receiver, sender};
 use std::cell::OnceCell;
 use std::collections::{HashSet, VecDeque};
 use std::io::Cursor;
