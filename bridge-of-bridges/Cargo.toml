@@ -7,6 +7,5 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [dependencies]
-cxx = "1.0"
 distributed_bridge = { path = "network" }
 spdlog_bridge = { path = "spdlog" }

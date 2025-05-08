@@ -1,6 +1,5 @@
-use crate::protocol::{
-    DataChannelRequest, DataChannelResponse, TupleBuffer, data_channel_receiver,
-};
+use crate::protocol;
+use crate::protocol::TupleBuffer;
 use crate::receiver::network_service::{DataQueue, Error};
 use futures::{SinkExt, StreamExt};
 use std::time::Duration;
@@ -33,7 +32,9 @@ pub(crate) async fn data_channel_handler(
         }
     };
 
-    let (mut reader, mut writer) = data_channel_receiver(stream);
+    // Represents a bidirectional data flow via the TcpStream object between the upstream host 
+    // that we receive from (reader) and respond to (writer).
+    let (mut reader, mut writer) = protocol::data_channel_receiver(stream);
 
     let mut arrived_buffer: Option<TupleBuffer> = None;
     info!("Accepted data channel connection from {address}");
@@ -49,17 +50,17 @@ pub(crate) async fn data_channel_handler(
                     match write_queue_result {
                         Ok(_) => {
                             match cancellation_token.run_until_cancelled(
-                                writer.send(DataChannelResponse::AckData(seq_number))
+                                writer.send(protocol::DataChannelResponse::AckData(seq_number))
                             ).await {
                                 None => return Err(ChannelHandlerError::Cancelled),
                                 Some(Err(e)) => return Err(ChannelHandlerError::Network(e.into())),
                                 Some(Ok(_)) => (),
                             }
                         },
-                        // Channel was closed, propagate this back to the sender via the network
+                        // Channel was closed by the network bridge, propagate this back to the sender via the network
                         Err(_) => {
                             match cancellation_token.run_until_cancelled(
-                                writer.send(DataChannelResponse::Close)
+                                writer.send(protocol::DataChannelResponse::Close)
                             ).await {
                                 None => return Err(ChannelHandlerError::Cancelled),
                                 Some(Err(e)) => return Err(ChannelHandlerError::Network(e.into())),
@@ -78,8 +79,8 @@ pub(crate) async fn data_channel_handler(
                 match next_request {
                     None => return Err(ChannelHandlerError::Network("Connection lost".into())),
                     Some(Err(e)) => return Err(ChannelHandlerError::Network(e.into())),
-                    Some(Ok(DataChannelRequest::Data(buf))) => Some(buf),
-                    Some(Ok(DataChannelRequest::Close)) => {
+                    Some(Ok(protocol::DataChannelRequest::Data(buf))) => Some(buf),
+                    Some(Ok(protocol::DataChannelRequest::Close)) => {
                         queue.close();
                         return Err(ChannelHandlerError::ClosedByOtherSide);
                     }

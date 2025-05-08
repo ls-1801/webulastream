@@ -1,7 +1,5 @@
-use crate::protocol::{
-    ChannelIdentifier, ConnectionIdentifier, ControlChannelRequest, ControlChannelResponse,
-    ControlChannelSenderReader, ControlChannelSenderWriter, control_channel_sender,
-};
+use crate::protocol;
+use crate::protocol::{ChannelIdentifier, ConnectionIdentifier};
 use crate::sender::cancellation::{Cancellable, cancel_all};
 use crate::sender::data_channel_handler;
 use crate::sender::data_channel_handler::ChannelHandlerResult;
@@ -45,8 +43,8 @@ impl Cancellable for CancellationToken {
 // Failed attempts will return an EstablishChannelResult that indicates the cause of the failure,
 // leading to a retry or cancellation of the channel.
 async fn establish_data_channel(
-    control_channel_sender_writer: &mut ControlChannelSenderWriter,
-    control_channel_sender_reader: &mut ControlChannelSenderReader,
+    control_channel_sender_writer: &mut protocol::ControlChannelSenderWriter,
+    control_channel_sender_reader: &mut protocol::ControlChannelSenderReader,
     connection_id: &ConnectionIdentifier,
     channel: ChannelIdentifier,
     channel_cancellation_token: CancellationToken,
@@ -59,7 +57,7 @@ async fn establish_data_channel(
             return EstablishChannelResult::Cancelled;
         },
         result = control_channel_sender_writer.send(
-            ControlChannelRequest::ChannelRequest(channel.clone())
+            protocol::ControlChannelRequest::ChannelRequest(channel.clone())
         ) => {
             match result {
                 Ok(()) => {}
@@ -78,8 +76,8 @@ async fn establish_data_channel(
     let port = select! {
         _ = channel_cancellation_token.cancelled() => return EstablishChannelResult::Cancelled,
         negotiated_port = control_channel_sender_reader.next() => match negotiated_port {
-            Some(Ok(ControlChannelResponse::OkChannelResponse(port))) => port,
-            Some(Ok(ControlChannelResponse::DenyChannelResponse)) => return EstablishChannelResult::ChannelReject(channel, queue),
+            Some(Ok(protocol::ControlChannelResponse::OkChannelResponse(port))) => port,
+            Some(Ok(protocol::ControlChannelResponse::DenyChannelResponse)) => return EstablishChannelResult::ChannelReject(channel, queue),
             Some(Err(e)) => return EstablishChannelResult::BadConnection(channel, queue, e.into()),
             None => return EstablishChannelResult::BadConnection(channel, queue, "Connection closed".into()),
         }
@@ -255,8 +253,8 @@ async fn handle_pending_data_channels(
     active_channels: &mut HashMap<ChannelIdentifier, CancellationToken>,
     connection_id: &ConnectionIdentifier,
     connection_cancellation_token: CancellationToken,
-    sender_writer: &mut ControlChannelSenderWriter,
-    sender_reader: &mut ControlChannelSenderReader,
+    sender_writer: &mut protocol::ControlChannelSenderWriter,
+    sender_reader: &mut protocol::ControlChannelSenderReader,
     connection_controller: ConnectionController,
 ) -> (
     Vec<(
@@ -341,7 +339,7 @@ pub(crate) async fn control_channel_handler(
         };
 
         // At this point, we have a connection to `connection_id` and can process requests to create data channels
-        let (mut reader, mut writer) = control_channel_sender(connection);
+        let (mut reader, mut writer) = protocol::control_channel_sender(connection);
         // 2. accept channel requests in a loop
         // The only reason to exit this loop is when the control connection is lost
         loop {
@@ -359,16 +357,17 @@ pub(crate) async fn control_channel_handler(
                 return cancel_all(active_data_channels);
             }
 
-            let (updated_pending_channels, control_connection_failure) = handle_pending_data_channels(
-                pending_data_channels,
-                &mut active_data_channels,
-                &connection_id,
-                connection_cancellation_token.clone(),
-                &mut writer,
-                &mut reader,
-                controller.clone(),
-            )
-            .await;
+            let (updated_pending_channels, control_connection_failure) =
+                handle_pending_data_channels(
+                    pending_data_channels,
+                    &mut active_data_channels,
+                    &connection_id,
+                    connection_cancellation_token.clone(),
+                    &mut writer,
+                    &mut reader,
+                    controller.clone(),
+                )
+                .await;
             pending_data_channels = updated_pending_channels;
             // retry to establish control connection if it failed, otherwise accept new channel requests
             if control_connection_failure {

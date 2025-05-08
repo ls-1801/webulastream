@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "rust/cxx.h"
+#include <rust/cxx.h>
 
 #include <Runtime/AbstractBufferProvider.hpp>
 #include <folly/Synchronized.h>
@@ -33,6 +33,8 @@ public:
     void add_child_buffer(rust::Slice<const uint8_t>);
 
 private:
+    // Raw buffer
     NES::Memory::TupleBuffer& buffer;
+    // Might be used to allocate child buffers for variable-sized data
     NES::Memory::AbstractBufferProvider& bufferProvider;
 };

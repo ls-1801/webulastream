@@ -15,12 +15,12 @@ use tracing::{Instrument, info, info_span};
 pub(crate) async fn network_receiver_listener(
     listener: NetworkServiceControlListener,
     controller: NetworkServiceController,
-    connection_identifier: ConnectionIdentifier,
+    connection_id: ConnectionIdentifier,
 ) -> crate::receiver::network_service::Result<()> {
-    info!("Starting control channel: {}", connection_identifier);
+    info!("Starting control channel: {}", connection_id);
     // We do a passive open here, because we as a receiver act as a server to the upstream client
     // After binding to the specified port, we listen for incoming connections from upstream hosts
-    let listener_port = TcpListener::bind(connection_identifier.parse::<SocketAddr>()?).await?;
+    let listener_port = TcpListener::bind(connection_id.parse::<SocketAddr>()?).await?;
     // State of the listener: mapping channel_id's to a sender side of a queue and a cancellation token
     // A registered channel does not mean that a corresponding physical data channel in form of
     // a TCP connection already exists, just that an interest in creating such a channel was registered.
@@ -54,12 +54,12 @@ pub(crate) async fn network_receiver_listener(
                     });
                     return Ok(())
                 },
-                Ok(NetworkServiceControlMessage::RegisterChannel(channel_id, emit_fn, response)) => {
+                Ok(NetworkServiceControlMessage::RegisterChannel(channel_id, data_queue, response)) => {
                     let token = CancellationToken::new();
                     {
                         let mut locked = registered_channels.write().await;
                         locked.retain(|_, (_, token)| !token.is_cancelled());
-                        locked.insert(channel_id, (emit_fn, token.clone()));
+                        locked.insert(channel_id, (data_queue, token.clone()));
                     }
 
                     match response.send(()) {
@@ -68,7 +68,7 @@ pub(crate) async fn network_receiver_listener(
                     }
                 }
                 // The existing channel will be updated with the new emit_fn and cancellation token provided by the message
-                Ok(NetworkServiceControlMessage::RetryChannel(channel_id, emit_fn, token)) => {registered_channels.write().await.insert(channel_id, (emit_fn, token));}
+                Ok(NetworkServiceControlMessage::RetryChannel(channel_id, data_queue, token)) => {registered_channels.write().await.insert(channel_id, (data_queue, token));}
             }
         }
     }

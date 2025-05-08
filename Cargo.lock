@@ -104,7 +104,6 @@ dependencies = [
 name = "bridge_of_bridges"
 version = "0.1.0"
 dependencies = [
- "cxx",
  "distributed_bridge",
  "spdlog_bridge",
 ]
@@ -277,7 +276,6 @@ dependencies = [
  "cxx",
  "nes_network",
  "once_cell",
- "spdlog_bridge",
  "tokio",
 ]
 

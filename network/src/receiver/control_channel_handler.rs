@@ -1,6 +1,5 @@
-use crate::protocol::{
-    ChannelIdentifier, ControlChannelRequest, ControlChannelResponse, control_channel_receiver,
-};
+use crate::protocol;
+use crate::protocol::ChannelIdentifier;
 use crate::receiver::data_channel_handler::ChannelHandlerError;
 use crate::receiver::data_channel_handler::data_channel_handler;
 use crate::receiver::network_service::{
@@ -109,8 +108,8 @@ pub(crate) async fn control_channel_handler(
     stream: TcpStream,
     registered_channels: RegisteredChannels,
     control: NetworkServiceController,
-) -> Result<ControlChannelRequest> {
-    let (mut reader, mut writer) = control_channel_receiver(stream);
+) -> Result<protocol::ControlChannelRequest> {
+    let (mut reader, mut writer) = protocol::control_channel_receiver(stream);
     let mut active_channels = vec![];
     loop {
         // First await receiving a message that is a channel request from upstream via the established TCP control channel
@@ -129,22 +128,24 @@ pub(crate) async fn control_channel_handler(
 
         // We have received a valid channel request from upstream
         match request {
-            ControlChannelRequest::ChannelRequest(channel) => {
+            protocol::ControlChannelRequest::ChannelRequest(channel) => {
                 // Remove channels that have been cancelled
                 active_channels.retain(|token: &CancellationToken| !token.is_cancelled());
                 // Move the data queue and the cancel token out of the registered_channels if one exists
                 // If not, send a deny channel response since we do not know about the channel yet
-                let Some((emit, token)) = registered_channels.write().await.remove(&channel) else {
+                let Some((data_queue, token)) = registered_channels.write().await.remove(&channel)
+                else {
                     writer
-                        .send(ControlChannelResponse::DenyChannelResponse)
+                        .send(protocol::ControlChannelResponse::DenyChannelResponse)
                         .await?;
                     continue;
                 };
 
                 let port =
-                    create_channel_handler(channel, emit, token.clone(), control.clone()).await?;
+                    create_channel_handler(channel, data_queue, token.clone(), control.clone())
+                        .await?;
                 writer
-                    .send(ControlChannelResponse::OkChannelResponse(port))
+                    .send(protocol::ControlChannelResponse::OkChannelResponse(port))
                     .await?;
                 // Push the newly created data channel to active_channels via its cancellation token
                 // We do not require more state associated with the channel as closing propagates to us

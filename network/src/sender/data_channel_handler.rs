@@ -1,8 +1,5 @@
 use crate::protocol;
-use crate::protocol::{
-    DataChannelRequest, DataChannelResponse, DataChannelSenderReader, DataChannelSenderWriter,
-    TupleBuffer,
-};
+use crate::protocol::TupleBuffer;
 use futures::SinkExt;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -47,9 +44,9 @@ pub(crate) struct ChannelHandler {
     // Pending buffers that have been sent, but have not yet received an ACK
     wait_for_ack: HashMap<u64, TupleBuffer>,
     // Handle to write to the TcpStream
-    writer: DataChannelSenderWriter,
+    writer: protocol::DataChannelSenderWriter,
     // Handle to read from the TcpStream
-    reader: DataChannelSenderReader,
+    reader: protocol::DataChannelSenderReader,
     queue: ChannelControlQueueListener,
 }
 
@@ -83,7 +80,7 @@ impl ChannelHandler {
                 let _ = done.send(());
             }
             ChannelControlMessage::Terminate => {
-                let _ = self.writer.send(DataChannelRequest::Close).await;
+                let _ = self.writer.send(protocol::DataChannelRequest::Close).await;
                 return Err(ChannelHandlerError::Terminated);
             }
         }
@@ -91,16 +88,16 @@ impl ChannelHandler {
     }
 
     // Handle a response from the receiver at the downstream host
-    fn handle_response(&mut self, response: DataChannelResponse) -> Result<()> {
+    fn handle_response(&mut self, response: protocol::DataChannelResponse) -> Result<()> {
         info!("Received response from downstream host: {:?}", response);
         match response {
             // Request to close the data channel
-            DataChannelResponse::Close => {
+            protocol::DataChannelResponse::Close => {
                 info!("Channel closed by other receiver");
                 return Err(ChannelHandlerError::ClosedByOtherSide);
             }
             // Receiver has NACKed buffer with sequence number seq, move back into pending list
-            DataChannelResponse::NAckData(seq) => {
+            protocol::DataChannelResponse::NAckData(seq) => {
                 if let Some(write) = self.wait_for_ack.remove(&seq) {
                     warn!("NAck for {seq}");
                     self.pending_writes.push_back(write);
@@ -111,7 +108,7 @@ impl ChannelHandler {
                 }
             }
             // Receiver has ACKed buffer with sequence number seq, remove from list
-            DataChannelResponse::AckData(seq) => {
+            protocol::DataChannelResponse::AckData(seq) => {
                 let Some(_) = self.wait_for_ack.remove(&seq) else {
                     return Err(ChannelHandlerError::Protocol(
                         format!("Protocol Error. Unknown Seq {seq}").into(),
@@ -127,7 +124,7 @@ impl ChannelHandler {
     // Sends the oldest buffer through the data channel
     // On success, move the buffer to the wait_for_ack map
     async fn send_pending(
-        writer: &mut DataChannelSenderWriter,
+        writer: &mut protocol::DataChannelSenderWriter,
         pending_writes: &mut VecDeque<TupleBuffer>,
         wait_for_ack: &mut HashMap<u64, TupleBuffer>,
     ) -> Result<()> {
@@ -138,7 +135,7 @@ impl ChannelHandler {
         let next_buffer = pending_writes.front().expect("BUG: check value earlier");
 
         if writer
-            .feed(DataChannelRequest::Data(next_buffer.clone()))
+            .feed(protocol::DataChannelRequest::Data(next_buffer.clone()))
             .await
             .is_ok()
         {
