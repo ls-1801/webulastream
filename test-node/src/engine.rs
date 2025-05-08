@@ -6,12 +6,8 @@ use std::sync::{Arc, Mutex};
 use threadpool::ThreadPool;
 use tracing::{error, info};
 
-type ComputeFn = Box<dyn Fn(TupleBuffer) -> TupleBuffer + Sync + Send>;
 pub(crate) type EmitFn = Box<dyn Fn(TupleBuffer) + Sync + Send>;
 type Queue = crossbeam_queue::ArrayQueue<Task>;
-struct SimplePipeline {
-    pub fun: ComputeFn,
-}
 
 pub struct Node {
     pipeline: Arc<dyn ExecutablePipeline + Send + Sync>,
@@ -26,8 +22,8 @@ impl Drop for Node {
 
 impl Node {
     pub fn new(
-        successor: Option<Arc<Node>>,
         pipeline: Arc<dyn ExecutablePipeline + Send + Sync>,
+        successor: Option<Arc<Node>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             pipeline,
@@ -56,12 +52,12 @@ impl SourceNode {
 
 impl SourceNode {
     pub fn new(
-        successor: Arc<Node>,
         implementation: Box<dyn SourceImpl + Send + Sync>,
+        successor: Arc<Node>,
     ) -> SourceNode {
         SourceNode {
-            successor,
             implementation,
+            successor,
         }
     }
 }
@@ -70,9 +66,11 @@ pub trait SourceImpl {
     fn start(&self, emit: EmitFn);
     fn stop(&self);
 }
+
 pub trait PipelineContext {
     fn emit(&mut self, data: TupleBuffer);
 }
+
 pub trait ExecutablePipeline {
     fn execute(&self, data: &TupleBuffer, context: &mut dyn PipelineContext);
     fn stop(&self);
@@ -105,9 +103,9 @@ pub struct QueryEngine {
 impl Default for QueryEngine {
     fn default() -> Self {
         QueryEngine {
+            id_counter: AtomicUsize::default(),
             queue: Arc::new(crossbeam_queue::ArrayQueue::new(1024)),
             queries: Mutex::default(),
-            id_counter: AtomicUsize::default(),
         }
     }
 }
@@ -167,6 +165,7 @@ impl QueryEngine {
             error!("Query with id {id} does not exist!");
         }
     }
+    
     pub fn start_query(self: &Arc<Self>, query: Query) -> usize {
         let id = self.id_counter.fetch_add(1, Relaxed);
         for source in &query.sources {

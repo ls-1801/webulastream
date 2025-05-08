@@ -20,7 +20,6 @@
 #include <network/lib.h>
 #include <ErrorHandling.hpp>
 
-
 void init_receiver_server_string(std::string connection)
 {
     init_receiver_server(rust::String(std::move(connection)));
@@ -40,12 +39,13 @@ void TupleBufferBuilder::set_data(rust::Slice<const uint8_t> data)
 {
     INVARIANT(
         buffer.getBufferSize() >= data.length(),
-        "Buffer size missmatch. Internal BufferSize: {} vs. External {}",
+        "Buffer size mismatch. Internal BufferSize: {} vs. External {}",
         buffer.getBufferSize(),
         data.length());
 
     memcpy(buffer.getBuffer(), data.data(), std::min(data.length(), buffer.getBufferSize()));
 }
+
 void TupleBufferBuilder::add_child_buffer(rust::Slice<const uint8_t> child)
 {
     const auto childBuffer = bufferProvider.getUnpooledBuffer(child.size());

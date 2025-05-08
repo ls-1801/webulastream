@@ -12,7 +12,7 @@
         input_channel: channel_2
         ingestion_rate_in_milliseconds: 20
     - type: Wait
-      millis: 200000
+      millis: 20000
 - connection: 127.0.0.1:8001
   commands:
     - type: StartQuery
@@ -27,4 +27,4 @@
         input_channel: channel_1
         ingestion_rate_in_milliseconds: 200
     - type: Wait
-      millis: 200000
+      millis: 20000

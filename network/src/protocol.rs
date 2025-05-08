@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio_serde::formats::Cbor;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_serde::Framed;
+use tokio_serde::formats::Cbor;
 use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -26,8 +26,8 @@ pub enum DataChannelRequest {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DataChannelResponse {
-    AckData(u64),
-    NAckData(u64),
+    AckData(u64), // Upon receival of a buffer, ACK it
+    NAckData(u64), // Currently not used by the receiver
     Close,
 }
 
@@ -45,7 +45,8 @@ pub struct TupleBuffer {
 
 impl Debug for TupleBuffer {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("TupleBuffer{{ sequence_number: {}, origin_id: {}, chunk_number: {}, watermark: {}, number_of_tuples: {}, bufferSize: {}, children: {:?}}}", self.sequence_number, self.origin_id, self.chunk_number, self.watermark, self.number_of_tuples, self.data.len(), self.child_buffers.iter().map(|buffer| buffer.len()).collect::<Vec<_>>()))
+        f.write_fmt(format_args!("TupleBuffer{{ sequence_number: {}, origin_id: {}, chunk_number: {}, watermark: {}, number_of_tuples: {}, bufferSize: {}, children: {:?}}}", 
+                                 self.sequence_number, self.origin_id, self.chunk_number, self.watermark, self.number_of_tuples, self.data.len(), self.child_buffers.iter().map(|buffer| buffer.len()).collect::<Vec<_>>()))
     }
 }
 

@@ -8,26 +8,25 @@ use crate::engine::{
 use async_channel::TrySendError;
 use bytes::{Buf, BufMut, BytesMut};
 use clap::{Parser, Subcommand};
-use nes_network::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
-use nes_network::sender::ChannelControlMessage;
-use nes_network::{receiver, sender};
 use log::error;
+use nes_network::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
+use nes_network::receiver::network_service::ReceiverNetworkService;
+use nes_network::sender;
+use nes_network::sender::data_channel_handler::ChannelControlMessage;
+use nes_network::sender::network_service::SenderNetworkService;
+use std::cell::OnceCell;
 use std::collections::{HashSet, VecDeque};
-use std::io::prelude::*;
 use std::io::Cursor;
+use std::io::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{sync, thread};
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 // mod inter_node {
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error>;
-struct ChannelParameter {
-    port: u16,
-}
 
 #[derive(Parser)]
 struct CLIArgs {
@@ -217,46 +216,48 @@ impl ExecutablePipeline for PrintSink {
 }
 
 struct NetworkSink {
-    service: Arc<sender::NetworkService>,
-    connection: ConnectionIdentifier,
-    channel: ChannelIdentifier,
-    queue: sync::RwLock<Option<sender::ChannelControlQueue>>,
-    buffer: std::sync::RwLock<VecDeque<TupleBuffer>>,
+    service: Arc<SenderNetworkService>,
+    connection_id: ConnectionIdentifier,
+    channel_id: ChannelIdentifier,
+    queue: sync::RwLock<Option<sender::data_channel_handler::ChannelControlQueue>>,
+    buffers: sync::RwLock<VecDeque<TupleBuffer>>,
 }
 
 impl NetworkSink {
     pub fn new(
-        service: Arc<sender::NetworkService>,
-        connection: ConnectionIdentifier,
-        channel: ChannelIdentifier,
+        service: Arc<SenderNetworkService>,
+        connection_id: ConnectionIdentifier,
+        channel_id: ChannelIdentifier,
     ) -> Self {
         Self {
             service,
-            connection,
-            channel,
-            queue: std::sync::RwLock::new(None),
-            buffer: std::sync::RwLock::new(VecDeque::new()),
+            connection_id,
+            channel_id,
+            queue: sync::RwLock::new(None),
+            buffers: sync::RwLock::new(VecDeque::new()),
         }
     }
 }
 
 impl ExecutablePipeline for NetworkSink {
     fn execute(&self, data: &TupleBuffer, _context: &mut dyn PipelineContext) {
+        // Initialize the network sink if does not yet exist, there is no ChannelControlQueue, which represents a data channel
         if self.queue.read().unwrap().is_none() {
             let mut write_locked = self.queue.write().unwrap();
             if write_locked.is_none() {
                 info!("Network Sink Setup");
                 write_locked.replace(
                     self.service
-                        .register_channel(self.connection.clone(), self.channel.clone())
+                        .register_channel(self.connection_id.clone(), self.channel_id.clone())
                         .unwrap(),
                 );
                 info!("Network Sink Setup Done");
             }
         }
 
-        if !self.buffer.read().unwrap().is_empty() {
-            let mut locked = self.buffer.write().unwrap();
+        // If there are buffers in the internal backlog of the sink, send them
+        if !self.buffers.read().unwrap().is_empty() {
+            let mut locked = self.buffers.write().unwrap();
             if !locked.is_empty() {
                 locked.push_back(data.clone());
                 while !locked.is_empty() {
@@ -267,9 +268,9 @@ impl ExecutablePipeline for NetworkSink {
                         .unwrap()
                         .as_ref()
                         .unwrap()
-                        .try_send(sender::ChannelControlMessage::Data(front))
+                        .try_send(ChannelControlMessage::Data(front))
                     {
-                        Err(TrySendError::Full(sender::ChannelControlMessage::Data(data))) => {
+                        Err(TrySendError::Full(ChannelControlMessage::Data(data))) => {
                             locked.push_front(data);
                             return;
                         }
@@ -282,16 +283,17 @@ impl ExecutablePipeline for NetworkSink {
             }
         }
 
+        // Send the current data buffer through the channel
         match self
             .queue
             .read()
             .unwrap()
             .as_ref()
             .unwrap()
-            .try_send(sender::ChannelControlMessage::Data(data.clone()))
+            .try_send(ChannelControlMessage::Data(data.clone()))
         {
-            Err(TrySendError::Full(sender::ChannelControlMessage::Data(data))) => {
-                self.buffer.write().unwrap().push_back(data);
+            Err(TrySendError::Full(ChannelControlMessage::Data(data))) => {
+                self.buffers.write().unwrap().push_back(data);
             }
             Err(TrySendError::Closed(_)) => {
                 panic!("Channel should not be closed");
@@ -330,16 +332,16 @@ impl ExecutablePipeline for NetworkSink {
 
 struct NetworkSource {
     channel: ChannelIdentifier,
-    service: Arc<receiver::NetworkService>,
+    service: Arc<ReceiverNetworkService>,
     ingestion_rate: Option<Duration>,
-    thread: std::sync::Mutex<Option<Thread<()>>>,
+    thread: Mutex<Option<Thread<()>>>,
 }
 
 impl NetworkSource {
     pub fn new(
         channel: ChannelIdentifier,
         ingestion_rate: Option<Duration>,
-        service: Arc<receiver::NetworkService>,
+        service: Arc<ReceiverNetworkService>,
     ) -> Self {
         Self {
             channel,
@@ -437,7 +439,7 @@ impl SourceImpl for GeneratorSource {
             move |stopped| {
                 let mut counter = 0_usize;
                 while !stopped.load(Ordering::Relaxed) {
-                    let buffer = vec![0u8; 16];
+                    let buffer = vec![0_u8; 16];
                     let mut cursor = Cursor::new(buffer);
                     while cursor.has_remaining() {
                         cursor.write_all(&counter.to_le_bytes()).unwrap();
@@ -489,44 +491,46 @@ fn generator(
     downstream_connection: ConnectionIdentifier,
     downstream_channel: ChannelIdentifier,
     ingestion_rate_in_milliseconds: Option<u64>,
-    sender: Arc<sender::NetworkService>,
+    sender: Arc<SenderNetworkService>,
     engine: Arc<QueryEngine>,
 ) -> usize {
-    let query = engine.start_query(Query::new(vec![SourceNode::new(
+    let query_id = engine.start_query(Query::new(vec![SourceNode::new(
+        // Source Implementation
+        Box::new(GeneratorSource::new(Duration::from_millis(
+            ingestion_rate_in_milliseconds.unwrap_or(250),
+        ))),
+        // Successor Node
         Node::new(
-            None,
             Arc::new(NetworkSink::new(
                 sender.clone(),
                 downstream_connection,
                 downstream_channel,
             )),
+            None,
         ),
-        Box::new(GeneratorSource::new(Duration::from_millis(
-            ingestion_rate_in_milliseconds.unwrap_or(250),
-        ))),
     )]));
 
-    query
+    query_id
 }
 
 fn sink(
     channel: ChannelIdentifier,
     ingestion_rate_in_milliseconds: Option<u64>,
     engine: Arc<QueryEngine>,
-    receiver: Arc<receiver::NetworkService>,
+    receiver: Arc<ReceiverNetworkService>,
 ) -> usize {
     engine.start_query(Query::new(vec![SourceNode::new(
-        Node::new(
-            None,
-            Arc::new(PrintSink {
-                sequence_tracker: Default::default(),
-            }),
-        ),
         Box::new(NetworkSource::new(
             channel,
             ingestion_rate_in_milliseconds.map(|millis| Duration::from_millis(millis)),
             receiver.clone(),
         )),
+        Node::new(
+            Arc::new(PrintSink {
+                sequence_tracker: Default::default(),
+            }),
+            None,
+        ),
     )]))
 }
 
@@ -536,25 +540,59 @@ fn bridge(
     downstream_connection: ConnectionIdentifier,
     ingestion_rate_in_milliseconds: Option<u64>,
     engine: Arc<QueryEngine>,
-    receiver: Arc<receiver::NetworkService>,
-    sender: Arc<sender::NetworkService>,
+    receiver: Arc<ReceiverNetworkService>,
+    sender: Arc<SenderNetworkService>,
 ) -> usize {
     let query = engine.start_query(Query::new(vec![SourceNode::new(
-        Node::new(
-            None,
-            Arc::new(NetworkSink::new(
-                sender.clone(),
-                downstream_connection,
-                downstream_channel,
-            )),
-        ),
         Box::new(NetworkSource::new(
             input_channel,
             ingestion_rate_in_milliseconds.map(|millis| Duration::from_millis(millis)),
             receiver.clone(),
         )),
+        Node::new(
+            Arc::new(NetworkSink::new(
+                sender.clone(),
+                downstream_connection,
+                downstream_channel,
+            )),
+            None,
+        ),
     )]));
     query
+}
+
+fn lazy_init_sender(sender: &OnceCell<Arc<SenderNetworkService>>) -> Arc<SenderNetworkService> {
+    sender
+        .get_or_init(|| {
+            SenderNetworkService::start(
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_name("sender")
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .unwrap(),
+            )
+        })
+        .clone()
+}
+
+fn lazy_init_receiver(
+    receiver: &OnceCell<Arc<ReceiverNetworkService>>,
+    connection_id: ConnectionIdentifier,
+) -> Arc<ReceiverNetworkService> {
+    receiver
+        .get_or_init(|| {
+            ReceiverNetworkService::start(
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_name("receiver")
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .unwrap(),
+                connection_id,
+            )
+        })
+        .clone()
 }
 
 fn main() {
@@ -563,22 +601,9 @@ fn main() {
 
     let config = config::load_config(std::path::Path::new(&args.file), args.index);
 
-    let engine = engine::QueryEngine::start();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("sender")
-        .enable_io()
-        .enable_time()
-        .build()
-        .unwrap();
-    let sender = sender::NetworkService::start(rt);
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("receiver")
-        .enable_io()
-        .enable_time()
-        .build()
-        .unwrap();
-    let receiver = receiver::NetworkService::start(rt, config.connection);
+    let engine = QueryEngine::start();
+    let sender: OnceCell<Arc<SenderNetworkService>> = OnceCell::new();
+    let receiver: OnceCell<Arc<ReceiverNetworkService>> = OnceCell::new();
 
     for command in config.commands.into_iter() {
         match command {
@@ -592,7 +617,7 @@ fn main() {
                         downstream_connection,
                         downstream_channel,
                         ingestion_rate_in_milliseconds,
-                        sender.clone(),
+                        lazy_init_sender(&sender),
                         engine.clone(),
                     ),
                     config::Query::Bridge {
@@ -606,8 +631,8 @@ fn main() {
                         downstream_connection,
                         ingestion_rate_in_milliseconds,
                         engine.clone(),
-                        receiver.clone(),
-                        sender.clone(),
+                        lazy_init_receiver(&receiver, config.connection.clone()),
+                        lazy_init_sender(&sender),
                     ),
                     config::Query::Sink {
                         input_channel,
@@ -616,7 +641,7 @@ fn main() {
                         input_channel,
                         ingestion_rate_in_milliseconds,
                         engine.clone(),
-                        receiver.clone(),
+                        lazy_init_receiver(&receiver, config.connection.clone()),
                     ),
                 };
             }
