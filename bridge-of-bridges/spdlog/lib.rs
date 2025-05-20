@@ -3,6 +3,7 @@ use std::fmt::Write;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::Layer;
+use tracing::{warn};
 
 #[cxx::bridge]
 mod ffi {
@@ -92,5 +93,7 @@ fn initialize_logging(logger: SharedPtr<ffi::SpdLogger>) {
 
     // Set the subscriber globally without calling init()
     let subscriber = tracing_subscriber::registry().with(spdlog_layer);
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set global subscriber");
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        warn!("Could not initialize rust logger: {e:?}");
+    }
 }
