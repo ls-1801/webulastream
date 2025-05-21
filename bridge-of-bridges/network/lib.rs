@@ -1,5 +1,7 @@
 use async_channel::TrySendError;
-use nes_network::protocol::{ConnectionIdentifier, TupleBuffer};
+use nes_network::protocol::{
+    ConnectionIdentifier, ThisConnectionIdentifier, TupleBuffer,
+};
 use nes_network::sender::{ChannelControlMessage, ChannelControlQueue};
 use nes_network::*;
 use once_cell::sync;
@@ -38,8 +40,8 @@ pub mod ffi {
         type ReceiverChannel;
 
         fn receiver_instance() -> Result<Box<ReceiverServer>>;
-        fn init_receiver_server(connection_identifier: String);
-        fn init_sender_server();
+        fn init_receiver_server(bind: String, connection_identifier: String) -> Result<()>;
+        fn init_sender_server(connection_identifier: String) -> Result<()>;
         fn sender_instance() -> Result<Box<SenderServer>>;
 
         fn register_receiver_channel(
@@ -90,7 +92,7 @@ struct ReceiverChannel {
     data_queue: Box<async_channel::Receiver<TupleBuffer>>,
 }
 
-fn init_sender_server() {
+fn init_sender_server(connection_identifier: String) -> Result<(), String> {
     SENDER.get_or_init(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .thread_name("net-receiver")
@@ -100,10 +102,14 @@ fn init_sender_server() {
             .worker_threads(2)
             .build()
             .unwrap();
-        sender::NetworkService::start(rt)
+        sender::NetworkService::start(rt, ThisConnectionIdentifier::from(connection_identifier))
     });
+    Ok(())
 }
-fn init_receiver_server(connection_identifier: ConnectionIdentifier) {
+fn init_receiver_server(bind: String, connection_identifier: String) -> Result<(), String> {
+    let bind = bind
+        .parse()
+        .map_err(|e| format!("Bind address `{bind}` is invalid: {e:?}"))?;
     RECEIVER.get_or_init(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .thread_name("net-sender")
@@ -113,8 +119,13 @@ fn init_receiver_server(connection_identifier: ConnectionIdentifier) {
             .enable_time()
             .build()
             .unwrap();
-        receiver::NetworkService::start(rt, connection_identifier)
+        receiver::NetworkService::start(
+            rt,
+            bind,
+            ThisConnectionIdentifier::from(connection_identifier),
+        )
     });
+    Ok(())
 }
 
 fn receiver_instance() -> Result<Box<ReceiverServer>, Box<dyn Error>> {
@@ -190,7 +201,10 @@ fn register_sender_channel(
 ) -> Box<SenderChannel> {
     let data_queue = server
         .handle
-        .register_channel(connection_identifier, channel_identifier)
+        .register_channel(
+            ConnectionIdentifier::from(connection_identifier),
+            channel_identifier,
+        )
         .unwrap();
     Box::new(SenderChannel { data_queue })
 }

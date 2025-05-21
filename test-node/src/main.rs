@@ -8,27 +8,22 @@ use crate::engine::{
 use async_channel::TrySendError;
 use bytes::{Buf, BufMut, BytesMut};
 use clap::{Parser, Subcommand};
+use log::error;
 use nes_network::protocol::{ChannelIdentifier, ConnectionIdentifier, TupleBuffer};
 use nes_network::sender::ChannelControlMessage;
 use nes_network::{receiver, sender};
-use log::error;
 use std::collections::{HashSet, VecDeque};
-use std::io::prelude::*;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{sync, thread};
-use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 // mod inter_node {
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error>;
-struct ChannelParameter {
-    port: u16,
-}
-
 #[derive(Parser)]
 struct CLIArgs {
     file: String,
@@ -40,6 +35,9 @@ enum Commands {}
 
 struct PrintSink {
     sequence_tracker: Mutex<MissingSequenceTracker>,
+    counter: AtomicUsize,
+    expected_messages: Option<usize>,
+    expected_messages_uncertainty: Option<usize>,
 }
 
 fn verify_tuple_buffer(received: &TupleBuffer) -> bool {
@@ -199,6 +197,7 @@ fn testSequenceTracker() {
 
 impl ExecutablePipeline for PrintSink {
     fn execute(&self, data: &TupleBuffer, _context: &mut dyn PipelineContext) {
+        self.counter.fetch_add(1, Ordering::Relaxed);
         if !verify_tuple_buffer(data) {
             error!("Invalid data received");
         }
@@ -213,6 +212,21 @@ impl ExecutablePipeline for PrintSink {
             "Sink stopped. Last Sequence: {}",
             self.sequence_tracker.lock().unwrap().query() - 1
         );
+        let counter = self.counter.load(Ordering::Relaxed);
+        let receive_check = if let Some(expected_messages) = self.expected_messages {
+            let uncertainty = self.expected_messages_uncertainty.unwrap_or(0);
+            counter >= expected_messages - uncertainty && counter <= expected_messages + uncertainty
+        } else {
+            true
+        };
+        if !receive_check {
+            error!(
+                "Received {} messages, but expected {} messages (uncertainty: {})",
+                counter,
+                self.expected_messages.unwrap(),
+                self.expected_messages_uncertainty.unwrap_or(0)
+            );
+        }
     }
 }
 
@@ -222,6 +236,8 @@ struct NetworkSink {
     channel: ChannelIdentifier,
     queue: sync::RwLock<Option<sender::ChannelControlQueue>>,
     buffer: std::sync::RwLock<VecDeque<TupleBuffer>>,
+    should_close: Option<bool>,
+    closed: AtomicBool,
 }
 
 impl NetworkSink {
@@ -229,11 +245,14 @@ impl NetworkSink {
         service: Arc<sender::NetworkService>,
         connection: ConnectionIdentifier,
         channel: ChannelIdentifier,
+        should_close: Option<bool>,
     ) -> Self {
         Self {
             service,
             connection,
             channel,
+            should_close,
+            closed: AtomicBool::new(false),
             queue: std::sync::RwLock::new(None),
             buffer: std::sync::RwLock::new(VecDeque::new()),
         }
@@ -242,6 +261,11 @@ impl NetworkSink {
 
 impl ExecutablePipeline for NetworkSink {
     fn execute(&self, data: &TupleBuffer, _context: &mut dyn PipelineContext) {
+        if self.closed.load(Ordering::Acquire) {
+            trace!("Dropping message because sink is closed");
+            return;
+        }
+
         if self.queue.read().unwrap().is_none() {
             let mut write_locked = self.queue.write().unwrap();
             if write_locked.is_none() {
@@ -294,13 +318,34 @@ impl ExecutablePipeline for NetworkSink {
                 self.buffer.write().unwrap().push_back(data);
             }
             Err(TrySendError::Closed(_)) => {
-                panic!("Channel should not be closed");
+                self.closed.store(true, Ordering::Release);
             }
             _ => {}
         }
     }
 
     fn stop(&self) {
+        match (self.should_close, self.closed.load(Ordering::Acquire)) {
+            (Some(true), true) => {
+                info!("Sink was already closed as desired");
+                return;
+            }
+            (Some(false), true) => {
+                error!("Sink should have not been closed");
+                return;
+            }
+            (Some(true), false) => {
+                error!("Sink was not closed as desired, closing now");
+            }
+            (Some(false), false) => {
+                info!("Sink was not already closed as desired");
+            }
+            (None, true) => {
+                return;
+            }
+            (None, false) => {}
+        }
+
         info!("Closing Network Sink");
         let (tx, rx) = tokio::sync::oneshot::channel();
         let queue = self.queue.write().unwrap().take().unwrap();
@@ -491,6 +536,7 @@ fn generator(
     ingestion_rate_in_milliseconds: Option<u64>,
     sender: Arc<sender::NetworkService>,
     engine: Arc<QueryEngine>,
+    should_be_closed: Option<bool>,
 ) -> usize {
     let query = engine.start_query(Query::new(vec![SourceNode::new(
         Node::new(
@@ -499,6 +545,7 @@ fn generator(
                 sender.clone(),
                 downstream_connection,
                 downstream_channel,
+                should_be_closed,
             )),
         ),
         Box::new(GeneratorSource::new(Duration::from_millis(
@@ -514,12 +561,17 @@ fn sink(
     ingestion_rate_in_milliseconds: Option<u64>,
     engine: Arc<QueryEngine>,
     receiver: Arc<receiver::NetworkService>,
+    expected_messages: Option<usize>,
+    expected_messages_uncertainty: Option<usize>,
 ) -> usize {
     engine.start_query(Query::new(vec![SourceNode::new(
         Node::new(
             None,
             Arc::new(PrintSink {
                 sequence_tracker: Default::default(),
+                counter: Default::default(),
+                expected_messages,
+                expected_messages_uncertainty,
             }),
         ),
         Box::new(NetworkSource::new(
@@ -538,6 +590,7 @@ fn bridge(
     engine: Arc<QueryEngine>,
     receiver: Arc<receiver::NetworkService>,
     sender: Arc<sender::NetworkService>,
+    should_be_closed: Option<bool>,
 ) -> usize {
     let query = engine.start_query(Query::new(vec![SourceNode::new(
         Node::new(
@@ -546,6 +599,7 @@ fn bridge(
                 sender.clone(),
                 downstream_connection,
                 downstream_channel,
+                should_be_closed,
             )),
         ),
         Box::new(NetworkSource::new(
@@ -570,7 +624,7 @@ fn main() {
         .enable_time()
         .build()
         .unwrap();
-    let sender = sender::NetworkService::start(rt);
+    let sender = sender::NetworkService::start(rt, config.connection.clone());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .thread_name("receiver")
@@ -578,7 +632,7 @@ fn main() {
         .enable_time()
         .build()
         .unwrap();
-    let receiver = receiver::NetworkService::start(rt, config.connection);
+    let receiver = receiver::NetworkService::start(rt, config.bind, config.connection);
 
     for command in config.commands.into_iter() {
         match command {
@@ -588,18 +642,21 @@ fn main() {
                         downstream_channel,
                         downstream_connection,
                         ingestion_rate_in_milliseconds,
+                        should_be_closed,
                     } => generator(
                         downstream_connection,
                         downstream_channel,
                         ingestion_rate_in_milliseconds,
                         sender.clone(),
                         engine.clone(),
+                        should_be_closed,
                     ),
                     config::Query::Bridge {
                         input_channel,
                         downstream_channel,
                         downstream_connection,
                         ingestion_rate_in_milliseconds,
+                        should_be_closed,
                     } => bridge(
                         input_channel,
                         downstream_channel,
@@ -608,15 +665,20 @@ fn main() {
                         engine.clone(),
                         receiver.clone(),
                         sender.clone(),
+                        should_be_closed,
                     ),
                     config::Query::Sink {
                         input_channel,
                         ingestion_rate_in_milliseconds,
+                        expected_messages,
+                        expected_messages_uncertainty,
                     } => sink(
                         input_channel,
                         ingestion_rate_in_milliseconds,
                         engine.clone(),
                         receiver.clone(),
+                        expected_messages,
+                        expected_messages_uncertainty,
                     ),
                 };
             }

@@ -1,38 +1,77 @@
-- connection: 8000
+# Test case uses 4 Workers
+#            ┌─►worker:8081─┐
+#            │              │
+# worker:8080│              ├─►worker:8083
+#            │              │
+#            └─►worker:8082─┘
+
+# This testcase as two queries: each one use one of the intermediate bridge nodes
+
+- connection: localhost:8000
+  bind: 0.0.0.0:8000
   commands:
     - type: StartQuery
       q:
         type: Source
         downstream_channel: channel_1
-        downstream_connection: 8001
+        downstream_connection: localhost:8001
+        ingestion_rate_in_milliseconds: 20
     - type: StartQuery
       q:
         type: Source
         downstream_channel: channel_2
-        downstream_connection: 8002
-- connection: 8001
+        downstream_connection: localhost:8002
+        ingestion_rate_in_milliseconds: 10
+    - type: Wait
+      millis: 20000
+    - type: StopQuery
+      id: 0
+    - type: StopQuery
+      id: 1
+- connection: localhost:8001
+  bind: 0.0.0.0:8001
   commands:
     - type: StartQuery
       q:
-        type: bridge
+        type: Bridge
         input_channel: channel_1
         downstream_channel: channel_1
-        downstream_connection: 8003
-- connection: 8002
+        downstream_connection: localhost:8003
+    - type: Wait
+      millis: 21000
+    - type: StopQuery
+      id: 0
+- connection: localhost:8002
+  bind: 0.0.0.0:8002
   commands:
     - type: StartQuery
       q:
-        type: bridge
+        type: Bridge
         input_channel: channel_2
         downstream_channel: channel_2
-        downstream_connection: 8003
-- connection: 8003
+        downstream_connection: localhost:8003
+    - type: Wait
+      millis: 21000
+    - type: StopQuery
+      id: 0
+- connection: localhost:8003
+  bind: 0.0.0.0:8003
   commands:
     - type: StartQuery
       q:
         type: Sink
         input_channel: channel_1
+        expected_messages: 1000
+        expected_messages_uncertainty: 50
     - type: StartQuery
       q:
         type: Sink
         input_channel: channel_2
+        expected_messages: 2000
+        expected_messages_uncertainty: 50
+    - type: Wait
+      millis: 22000
+    - type: StopQuery
+      id: 0
+    - type: StopQuery
+      id: 1

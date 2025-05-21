@@ -15,5 +15,5 @@ tracing = "0.1"
 
 serde = { version = "1.0.217", features = ["derive"] }
 tokio-stream = "0.1.17"
-tokio-serde = { version = "0.9", features = ["cbor", "serde_cbor"] }
+tokio-serde = { version = "0.9", features = ["cbor", "serde_cbor", "json", "serde_json"] }
 futures = "0.3.31"

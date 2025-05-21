@@ -1,15 +1,14 @@
 use crate::protocol::*;
 use futures::SinkExt;
 use std::collections::HashMap;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpSocket;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, info_span, warn, Instrument};
+use tracing::{Instrument, Span, debug, info, info_span, warn};
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -48,15 +47,82 @@ enum ChannelHandlerResult {
     Closed,
 }
 
+async fn connect(target_identifier: ConnectionIdentifier) -> Result<TcpStream> {
+    let address = target_identifier.to_socket_address().await?;
+    let socket = TcpSocket::new_v4().map_err(|e| format!("Could not create TCP socket: {e:?}"))?;
+    socket
+        .connect(address)
+        .await
+        .map_err(|e| format!("Could not connect to {address:?}: {e:?}").into())
+}
+
+async fn create_connection(
+    this_connection: ThisConnectionIdentifier,
+    target_identifier: ConnectionIdentifier,
+) -> Result<(ControlChannelSenderReader, ControlChannelSenderWriter)> {
+    let stream = connect(target_identifier).await?;
+    let (mut read, mut write) = identification_sender(stream);
+    write
+        .send(IdentificationRequest::IAmConnection(this_connection))
+        .await?;
+    let response = read
+        .next()
+        .await
+        .ok_or("Connection closed during identification")??;
+
+    let stream = read
+        .into_inner()
+        .into_inner()
+        .reunite(write.into_inner().into_inner())
+        .expect("Could not reunite streams");
+
+    match response {
+        IdentificationResponse::Ok => Ok(control_channel_sender(stream)),
+        IdentificationResponse::NotOk => {
+            Err("Could not establish connection. Identification was denied".into())
+        }
+    }
+}
+
+async fn create_channel(
+    this_connection: ThisConnectionIdentifier,
+    target_identifier: ConnectionIdentifier,
+    channel_identifier: ChannelIdentifier,
+) -> Result<(DataChannelSenderReader, DataChannelSenderWriter)> {
+    let stream = connect(target_identifier).await?;
+    let (mut read, mut write) = identification_sender(stream);
+    write
+        .send(IdentificationRequest::IAmChannel(
+            this_connection,
+            channel_identifier,
+        ))
+        .await?;
+
+    let response = read
+        .next()
+        .await
+        .ok_or("Connection closed during identification")??;
+
+    let stream = read
+        .into_inner()
+        .into_inner()
+        .reunite(write.into_inner().into_inner())
+        .expect("Could not reunite streams");
+
+    match response {
+        IdentificationResponse::Ok => Ok(data_channel_sender(stream)),
+        IdentificationResponse::NotOk => {
+            Err("Could not establish connection. Identification was denied".into())
+        }
+    }
+}
+
 mod channel_handler {
-    use crate::protocol;
-    use crate::protocol::{
-        DataChannelRequest, DataChannelResponse, DataChannelSenderReader, DataChannelSenderWriter,
-        TupleBuffer,
-    };
+
+    use crate::protocol::{DataChannelRequest, DataChannelResponse, DataChannelSenderReader, DataChannelSenderWriter, Sequence, TupleBuffer};
     use futures::SinkExt;
     use std::collections::{HashMap, VecDeque};
-    use tokio::net::TcpStream;
+
     use tokio::select;
     use tokio::sync::oneshot;
     use tokio_stream::StreamExt;
@@ -82,7 +148,7 @@ mod channel_handler {
     pub(super) struct ChannelHandler {
         cancellation_token: CancellationToken,
         pending_writes: VecDeque<TupleBuffer>,
-        wait_for_ack: HashMap<u64, TupleBuffer>,
+        wait_for_ack: HashMap<Sequence, TupleBuffer>,
         writer: DataChannelSenderWriter,
         reader: DataChannelSenderReader,
         queue: ChannelControlQueueListener,
@@ -93,11 +159,10 @@ mod channel_handler {
     impl ChannelHandler {
         pub fn new(
             cancellation_token: CancellationToken,
-            stream: TcpStream,
             queue: ChannelControlQueueListener,
+            reader: DataChannelSenderReader,
+            writer: DataChannelSenderWriter,
         ) -> Self {
-            let (reader, writer) = protocol::data_channel_sender(stream);
-
             Self {
                 cancellation_token,
                 pending_writes: Default::default(),
@@ -133,21 +198,21 @@ mod channel_handler {
                 }
                 DataChannelResponse::NAckData(seq) => {
                     if let Some(write) = self.wait_for_ack.remove(&seq) {
-                        warn!("NAck for {seq}");
+                        warn!("NAck for {seq:?}");
                         self.pending_writes.push_back(write);
                     } else {
                         return Err(ChannelHandlerError::Protocol(
-                            format!("Protocol Error. Unknown Seq {seq}").into(),
+                            format!("Protocol Error. Unknown Seq {seq:?}").into(),
                         ));
                     }
                 }
                 DataChannelResponse::AckData(seq) => {
                     let Some(_) = self.wait_for_ack.remove(&seq) else {
                         return Err(ChannelHandlerError::Protocol(
-                            format!("Protocol Error. Unknown Seq {seq}").into(),
+                            format!("Protocol Error. Unknown Seq {seq:?}").into(),
                         ));
                     };
-                    trace!("Ack for {seq}");
+                    trace!("Ack for {seq:?}");
                 }
             }
 
@@ -157,27 +222,38 @@ mod channel_handler {
         async fn send_pending(
             writer: &mut DataChannelSenderWriter,
             pending_writes: &mut VecDeque<TupleBuffer>,
-            wait_for_ack: &mut HashMap<u64, TupleBuffer>,
+            wait_for_ack: &mut HashMap<Sequence, TupleBuffer>,
         ) -> Result<()> {
             if pending_writes.is_empty() {
                 return Ok(());
             }
 
-            let next_buffer = pending_writes.front()
-                .expect("BUG: check value earlier");
+            let sequence_number = pending_writes
+                .front()
+                .expect("BUG: check value earlier")
+                .sequence();
+            wait_for_ack.insert(
+                sequence_number,
+                pending_writes
+                    .pop_front()
+                    .expect("BUG: checked value earlier"),
+            );
+            let next_buffer = wait_for_ack
+                .get(&sequence_number)
+                .expect("BUG: value was inserted earlier");
 
             if writer
                 .feed(DataChannelRequest::Data(next_buffer.clone()))
                 .await
-                .is_ok()
+                .is_err()
             {
-                wait_for_ack.insert(
-                        next_buffer.sequence_number,
-                    pending_writes
-                        .pop_front()
-                        .expect("BUG: checked value earlier"),
+                pending_writes.push_front(
+                    wait_for_ack
+                        .remove(&sequence_number)
+                        .expect("BUG: value was inserted earlier"),
                 );
             }
+
             Ok(())
         }
 
@@ -235,28 +311,29 @@ mod channel_handler {
 
 async fn channel_handler(
     cancellation_token: CancellationToken,
-    channel_address: SocketAddr,
+    this_connection: ThisConnectionIdentifier,
+    target_connection: ConnectionIdentifier,
+    channel_identifier: ChannelIdentifier,
     queue: channel_handler::ChannelControlQueueListener,
 ) -> ChannelHandlerResult {
-    let socket = match TcpSocket::new_v4() {
-        Ok(socket) => socket,
+    debug!("Channel negotiated. Connecting to {target_connection} on channel {channel_identifier}");
+    let (reader, writer) = match create_channel(
+        this_connection,
+        target_connection.clone(),
+        channel_identifier,
+    )
+    .await
+    {
+        Ok((reader, writer)) => (reader, writer),
         Err(e) => {
             return ChannelHandlerResult::ConnectionLost(
-                format!("Could not create socket {e:?}").into(),
-            )
+                format!("Could not create channel to {target_connection}: {e:?}").into(),
+            );
         }
     };
 
-    let connection = match cancellation_token
-        .run_until_cancelled(socket.connect(channel_address))
-        .await
-    {
-        None => return ChannelHandlerResult::Cancelled,
-        Some(Err(e)) => return ChannelHandlerResult::ConnectionLost(e.into()),
-        Some(Ok(connection)) => connection,
-    };
-
-    let mut handler = channel_handler::ChannelHandler::new(cancellation_token, connection, queue);
+    let mut handler =
+        channel_handler::ChannelHandler::new(cancellation_token, queue, reader, writer);
     match handler.run().await {
         Ok(_) => ChannelHandlerResult::Closed,
         Err(channel_handler::ChannelHandlerError::Terminated) => ChannelHandlerResult::Closed,
@@ -274,11 +351,8 @@ async fn channel_handler(
 }
 
 enum EstablishChannelResult {
-    Ok(CancellationToken),
-    ChannelReject(
-        ChannelIdentifier,
-        channel_handler::ChannelControlQueueListener,
-    ),
+    Ok,
+    ChannelReject,
     BadConnection(
         ChannelIdentifier,
         channel_handler::ChannelControlQueueListener,
@@ -290,7 +364,8 @@ enum EstablishChannelResult {
 async fn establish_channel(
     control_channel_sender_writer: &mut ControlChannelSenderWriter,
     control_channel_sender_reader: &mut ControlChannelSenderReader,
-    connection_identifier: &ConnectionIdentifier,
+    this_connection: &ThisConnectionIdentifier,
+    target_connection: &ConnectionIdentifier,
     channel: ChannelIdentifier,
     channel_cancellation_token: CancellationToken,
     queue: channel_handler::ChannelControlQueueListener,
@@ -309,7 +384,7 @@ async fn establish_channel(
                 channel,
                 queue,
                 format!("Could not send channel creation request {}", e).into(),
-            )
+            );
         }
         Some(Ok(())) => {}
     };
@@ -320,40 +395,33 @@ async fn establish_channel(
     {
         Some(Some(Ok(ControlChannelResponse::OkChannelResponse(port)))) => port,
         Some(Some(Ok(ControlChannelResponse::DenyChannelResponse))) => {
-            return EstablishChannelResult::ChannelReject(channel, queue)
+            return EstablishChannelResult::ChannelReject;
         }
         Some(Some(Err(e))) => {
-            return EstablishChannelResult::BadConnection(channel, queue, e.into())
+            return EstablishChannelResult::BadConnection(channel, queue, e.into());
         }
         Some(None) => {
             return EstablishChannelResult::BadConnection(
                 channel,
                 queue,
                 "Connection closed".into(),
-            )
+            );
         }
         None => return EstablishChannelResult::Cancelled,
     };
 
-    let channel_address = connection_identifier.to_socket_addrs();
-    let Ok(mut channel_address) = channel_address else {
-        return EstablishChannelResult::BadConnection(channel, queue, "Could not resolve connection identifier. DNS Lookup failed.".into())
-    };
-
-    let Some(channel_address) = channel_address.next() else {
-        return EstablishChannelResult::BadConnection(channel, queue, "Could not resolve connection identifier".into())
-    };
-
-    let channel_address = SocketAddr::new(channel_address.ip(), port);
-
     tokio::spawn(
         {
             let channel = channel.clone();
+            let this_connection = this_connection.clone();
+            let target_connection = target_connection.clone();
             let channel_cancellation_token = channel_cancellation_token.clone();
             async move {
                 match channel_handler(
                     channel_cancellation_token.clone(),
-                    channel_address,
+                    this_connection,
+                    target_connection,
+                    channel.clone(),
                     queue.clone(),
                 )
                 .await
@@ -384,191 +452,211 @@ async fn establish_channel(
                 }
             }
         }
-        .instrument(info_span!("channel handler", channel = %channel, port = %port)),
+        .instrument(info_span!("channel_handler", channel = %channel, port = %port)),
     );
-    EstablishChannelResult::Ok(channel_cancellation_token)
-}
-
-async fn accept_channel_requests(
-    cancellation_token: CancellationToken,
-    timeout: Duration,
-    active_channel: &mut HashMap<ChannelIdentifier, CancellationToken>,
-    listener: &mut NetworkingConnectionControlListener,
-) -> Option<
-    Vec<(
-        ChannelIdentifier,
-        CancellationToken,
-        channel_handler::ChannelControlQueueListener,
-    )>,
-> {
-    let mut pending = vec![];
-    let mut requests = vec![];
-
-    loop {
-        match cancellation_token
-            .run_until_cancelled(tokio::time::timeout(timeout, listener.recv()))
-            .await
-        {
-            None => return None,             // cancelled
-            Some(Err(_)) => break,           // timeout
-            Some(Ok(Err(_))) => return None, // queue closed
-            Some(Ok(Ok(request))) => {
-                requests.push(request);
-            }
-        }
-    }
-
-    for request in requests {
-        match request {
-            NetworkingConnectionControlMessage::RegisterChannel(channel, response) => {
-                let (sender, queue) = async_channel::bounded(100);
-                let channel_cancellation = CancellationToken::new();
-                if response.send(sender).is_err() {
-                    warn!("Channel registration was canceled");
-                    continue;
-                }
-                pending.push((channel, channel_cancellation, queue));
-            }
-            NetworkingConnectionControlMessage::RetryChannel(
-                active,
-                channel_cancellation,
-                queue,
-            ) => {
-                active_channel.remove(&active);
-                pending.push((active, channel_cancellation, queue));
-            }
-        }
-    }
-
-    Some(pending)
+    EstablishChannelResult::Ok
 }
 
 async fn connection_handler(
     connection_cancellation_token: CancellationToken,
-    connection_identifier: ConnectionIdentifier,
+    this_connection: ThisConnectionIdentifier,
+    target_connection: ConnectionIdentifier,
     controller: NetworkingConnectionController,
-    mut listener: NetworkingConnectionControlListener,
+    listener: NetworkingConnectionControlListener,
 ) -> Result<()> {
-    let mut pending_channels: Vec<(
-        ChannelIdentifier,
-        CancellationToken,
-        channel_handler::ChannelControlQueueListener,
-    )> = vec![];
-    let mut active_channel: HashMap<ChannelIdentifier, CancellationToken> = HashMap::default();
-    let on_cancel = |active_channel: HashMap<ChannelIdentifier, CancellationToken>| {
-        active_channel
-            .into_iter()
-            .for_each(|(_, token)| token.cancel());
-        Ok(())
-    };
+    let (connection_tx, mut connection_rx) = tokio::sync::mpsc::channel::<(
+        ControlChannelSenderReader,
+        ControlChannelSenderWriter,
+        tokio::sync::oneshot::Sender<()>,
+    )>(1);
+    let (channel_tx, mut channel_rx) = tokio::sync::mpsc::channel::<(
+        (
+            ChannelIdentifier,
+            CancellationToken,
+            channel_handler::ChannelControlQueueListener,
+        ),
+        tokio::sync::oneshot::Sender<EstablishChannelResult>,
+    )>(10);
 
-    let mut retry = 0;
-    'connection: loop {
-        if let Some(mut new_pending_channels) = accept_channel_requests(
-            connection_cancellation_token.clone(),
-            Duration::from_millis(10),
-            &mut active_channel,
-            &mut listener,
-        )
-        .await
+    tokio::spawn(
         {
-            pending_channels.append(&mut new_pending_channels);
-        } else {
-            return on_cancel(active_channel);
+            let target_connection = target_connection.clone();
+            let this_connection = this_connection.clone();
+            let connection_cancellation_token = connection_cancellation_token.clone();
+            async move {
+                let mut retry = 0;
+                loop {
+                    let Some(connection_result) = connection_cancellation_token
+                        .run_until_cancelled(create_connection(
+                            this_connection.clone(),
+                            target_connection.clone(),
+                        ))
+                        .await
+                    else {
+                        return;
+                    };
+
+                    let (reader, writer) = match connection_result {
+                        Ok((reader, writer)) => (reader, writer),
+                        Err(e) => {
+                            warn!(
+                                "Could not create connection to {}: {e:?}",
+                                target_connection
+                            );
+                            retry = retry + 1;
+                            tokio::time::sleep(Duration::from_secs(retry)).await;
+                            continue;
+                        }
+                    };
+                    retry = 0;
+                    info!("Connection to {} was established", target_connection);
+                    let (tx, rx) = oneshot::channel();
+                    if connection_tx.send((reader, writer, tx)).await.is_err() {
+                        return;
+                    }
+                    if rx.await.is_err() {
+                        return;
+                    }
+                }
+            }
         }
+        .instrument(Span::current()),
+    );
 
-        let socket = TcpSocket::new_v4()?;
-
-        let connection_address = connection_identifier.to_socket_addrs().map_err(|_| "Failed to to DNS Lookup")?.next();
-        let connection_address = connection_address.ok_or("Could not resolve connection identifier")?;
-        let connection = match connection_cancellation_token
-            .run_until_cancelled(socket.connect(connection_address))
-            .await
-        {
-            None => return on_cancel(active_channel),
-            Some(Ok(connection)) => connection,
-            Some(Err(e)) => {
-                retry += 1;
-                warn!("Could not establish connection {}.Retry in {} s", e, retry);
-                tokio::time::sleep(Duration::from_secs(retry)).await;
-                continue;
+    tokio::spawn({
+        let connection_cancellation_token = connection_cancellation_token.clone();
+        let this_connection = this_connection.clone();
+        let target_connection = target_connection.clone();
+        async move {
+            'connection: loop {
+                let Some((mut reader, mut writer, reconnect)) = connection_rx.recv().await else {
+                    return;
+                };
+                loop {
+                    let Some(((channel, channel_cancellation_token, queue), response)) =
+                        channel_rx.recv().await
+                    else {
+                        return;
+                    };
+                    match connection_cancellation_token
+                        .run_until_cancelled(establish_channel(
+                            &mut writer,
+                            &mut reader,
+                            &this_connection,
+                            &target_connection,
+                            channel.clone(),
+                            channel_cancellation_token.clone(),
+                            queue,
+                            controller.clone(),
+                        ))
+                        .await
+                    {
+                        None => {
+                            return;
+                        }
+                        Some(EstablishChannelResult::Cancelled) => {
+                            return;
+                        }
+                        Some(EstablishChannelResult::BadConnection(c, ct, q)) => {
+                            let _ = response.send(EstablishChannelResult::BadConnection(c, ct, q));
+                            let _ = reconnect.send(());
+                            continue 'connection;
+                        }
+                        Some(r) => {
+                            let _ = response.send(r);
+                        }
+                    }
+                }
             }
-        };
+        }
+    });
 
-        let (mut reader, mut writer) = control_channel_sender(connection);
-
-        retry = 0;
-
+    async fn attempt_channel_registration(
+        channel: ChannelIdentifier,
+        channel_cancellation: CancellationToken,
+        queue: channel_handler::ChannelControlQueueListener,
+        channel_tx: tokio::sync::mpsc::Sender<(
+            (
+                ChannelIdentifier,
+                CancellationToken,
+                channel_handler::ChannelControlQueueListener,
+            ),
+            tokio::sync::oneshot::Sender<EstablishChannelResult>,
+        )>,
+    ) {
+        let mut retry = 0;
         loop {
-            if let Some(mut new_pending_channels) = accept_channel_requests(
-                connection_cancellation_token.clone(),
-                Duration::from_millis(10),
-                &mut active_channel,
-                &mut listener,
-            )
-            .await
+            let (tx, rx) = oneshot::channel();
+            if channel_tx
+                .send((
+                    (channel.clone(), channel_cancellation.clone(), queue.clone()),
+                    tx,
+                ))
+                .await
+                .is_err()
             {
-                pending_channels.append(&mut new_pending_channels);
-            } else {
-                return on_cancel(active_channel);
+                return;
             }
-
-            let mut updated_pending_channels = vec![];
-            let mut connection_failure = false;
-            for (channel, channel_cancellation_token, queue) in pending_channels {
-                if channel_cancellation_token.is_cancelled() {
+            let Ok(result) = rx.await else {
+                return;
+            };
+            match result {
+                EstablishChannelResult::Ok | EstablishChannelResult::Cancelled => {
+                    return;
+                }
+                EstablishChannelResult::ChannelReject
+                | EstablishChannelResult::BadConnection(_, _, _) => {
+                    retry = retry + 1;
+                    tokio::time::sleep(Duration::from_millis(100 * retry)).await;
                     continue;
                 }
-                if connection_failure {
-                    updated_pending_channels.push((channel, channel_cancellation_token, queue));
-                    continue;
-                }
-                match connection_cancellation_token
-                    .run_until_cancelled(establish_channel(
-                        &mut writer,
-                        &mut reader,
-                        &connection_identifier,
-                        channel.clone(),
-                        channel_cancellation_token.clone(),
-                        queue,
-                        controller.clone(),
-                    ))
-                    .await
-                {
-                    None | Some(EstablishChannelResult::Cancelled) => {
-                        return on_cancel(active_channel)
-                    }
-                    Some(EstablishChannelResult::Ok(token)) => {
-                        active_channel.insert(channel, token);
-                    }
-                    Some(EstablishChannelResult::ChannelReject(channel, queue)) => {
-                        warn!("Channel {} was rejected", channel);
-                        updated_pending_channels.push((
-                            channel,
-                            channel_cancellation_token.clone(),
-                            queue,
-                        ));
-                    }
-                    Some(EstablishChannelResult::BadConnection(channel, queue, e)) => {
-                        warn!("Could not establish channel: {e:?}");
-                        connection_failure = true;
-                        updated_pending_channels.push((
-                            channel,
-                            channel_cancellation_token.clone(),
-                            queue,
-                        ));
-                    }
-                }
-            }
-            pending_channels = updated_pending_channels;
-            if connection_failure {
-                continue 'connection;
             }
         }
     }
+
+    loop {
+        let Ok(control_message) = listener.recv().await else {
+            return Ok(());
+        };
+        match control_message {
+            NetworkingConnectionControlMessage::RegisterChannel(channel, response) => {
+                tokio::spawn({
+                    let channel_tx = channel_tx.clone();
+                    async move {
+                        let (sender, queue) = async_channel::bounded(100);
+                        let channel_cancellation = CancellationToken::new();
+                        if response.send(sender).is_err() {
+                            warn!("Channel registration was canceled");
+                            return;
+                        }
+                        attempt_channel_registration(
+                            channel,
+                            channel_cancellation,
+                            queue,
+                            channel_tx,
+                        )
+                        .await;
+                    }
+                });
+            }
+            NetworkingConnectionControlMessage::RetryChannel(
+                channel,
+                channel_cancellation,
+                queue,
+            ) => {
+                tokio::spawn(attempt_channel_registration(
+                    channel,
+                    channel_cancellation,
+                    queue,
+                    channel_tx.clone(),
+                ));
+            }
+        };
+    }
 }
-async fn create_connection(
-    connection: &ConnectionIdentifier,
+async fn create_connection_handler(
+    this_connection: ThisConnectionIdentifier,
+    target_connection: ConnectionIdentifier,
 ) -> Result<(CancellationToken, NetworkingConnectionController)> {
     let (tx, rx) = async_channel::bounded::<NetworkingConnectionControlMessage>(1024);
     let control = tx.clone();
@@ -576,17 +664,18 @@ async fn create_connection(
     tokio::spawn(
         {
             let token = token.clone();
-            let connection = connection.clone();
+            let target_connection = target_connection.clone();
             async move {
                 info!(
                     "Connection is terminated: {:?}",
-                    connection_handler(token, connection, control, rx).await
+                    connection_handler(token, this_connection, target_connection, control, rx)
+                        .await
                 );
             }
         }
         .instrument(info_span!(
             "connection_handler",
-            connection = connection.clone()
+            connection = %target_connection
         )),
     );
     Ok((token, tx))
@@ -594,6 +683,7 @@ async fn create_connection(
 
 async fn network_sender_dispatcher(
     cancellation_token: CancellationToken,
+    this_connection: ThisConnectionIdentifier,
     control: NetworkingServiceControlListener,
 ) -> Result<()> {
     let mut connections: HashMap<
@@ -614,15 +704,23 @@ async fn network_sender_dispatcher(
         match cancellation_token.run_until_cancelled(control.recv()).await {
             None => return on_cancel(connections),
             Some(Err(_)) => return Err("Queue was closed".into()),
-            Some(Ok(NetworkingServiceControlMessage::RegisterChannel(connection, channel, tx))) => {
-                if !connections.contains_key(&connection) {
+            Some(Ok(NetworkingServiceControlMessage::RegisterChannel(
+                target_connection,
+                channel,
+                tx,
+            ))) => {
+                if !connections.contains_key(&target_connection) {
+                    info!("Creating connection to {}", target_connection);
                     match cancellation_token
-                        .run_until_cancelled(create_connection(&connection))
+                        .run_until_cancelled(create_connection_handler(
+                            this_connection.clone(),
+                            target_connection.clone(),
+                        ))
                         .await
                     {
                         None => return on_cancel(connections),
                         Some(Ok((token, controller))) => {
-                            connections.insert(connection.clone(), (token, controller));
+                            connections.insert(target_connection.clone(), (token, controller));
                         }
                         Some(Err(e)) => {
                             return Err(e);
@@ -633,7 +731,7 @@ async fn network_sender_dispatcher(
                 match cancellation_token
                     .run_until_cancelled(
                         connections
-                            .get(&connection)
+                            .get(&target_connection)
                             .expect("BUG: Just inserted the key")
                             .1
                             .send(NetworkingConnectionControlMessage::RegisterChannel(
@@ -653,19 +751,26 @@ async fn network_sender_dispatcher(
     }
 }
 impl NetworkService {
-    pub fn start(runtime: Runtime) -> Arc<NetworkService> {
+    pub fn start(
+        runtime: Runtime,
+        this_connection: ThisConnectionIdentifier,
+    ) -> Arc<NetworkService> {
         let (controller, listener) = async_channel::bounded(5);
         let cancellation_token = CancellationToken::new();
-        runtime.spawn({
-            let token = cancellation_token.clone();
-            async move {
-                info!("Starting sender network service");
-                info!(
-                    "sender network service stopped: {:?}",
-                    network_sender_dispatcher(token, listener).await
-                );
+        runtime.spawn(
+            {
+                let this_connection = this_connection.clone();
+                let token = cancellation_token.clone();
+                async move {
+                    info!("Starting sender network service");
+                    info!(
+                        "sender network service stopped: {:?}",
+                        network_sender_dispatcher(token, this_connection, listener).await
+                    );
+                }
             }
-        });
+            .instrument(info_span!("sender", this = %this_connection)),
+        );
 
         Arc::new(NetworkService {
             runtime: Mutex::new(Some(runtime)),

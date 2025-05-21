@@ -121,7 +121,7 @@ struct PEC<'a> {
 impl PipelineContext for PEC<'_> {
     fn emit(&mut self, data: TupleBuffer) {
         if let Some(successor) = self.successor {
-            self.queue
+            let _ = self.queue
                 .push(Task::Compute(self.query_id, data, successor.clone()));
         }
     }

@@ -33,35 +33,76 @@ enum ChannelHandlerError {
     ClosedByOtherSide,
     Cancelled,
     Network(Error),
-    Timeout,
+}
+
+pub enum ConnectionIdentification {
+    Connection(
+        ControlChannelReceiverReader,
+        ControlChannelReceiverWriter,
+        ConnectionIdentifier,
+    ),
+    Channel(
+        DataChannelReceiverReader,
+        DataChannelReceiverWriter,
+        ConnectionIdentifier,
+        ChannelIdentifier,
+    ),
+}
+pub async fn identify_connection(stream: TcpStream) -> Result<ConnectionIdentification> {
+    let (mut read, mut write) = identification_receiver(stream);
+    let response = read
+        .next()
+        .await
+        .ok_or("Connection Closed during Identification")??;
+
+    write.send(IdentificationResponse::Ok).await?;
+
+    let stream = read
+        .into_inner()
+        .into_inner()
+        .reunite(write.into_inner().into_inner())
+        .expect("Could not reunite streams");
+
+    match response {
+        IdentificationRequest::IAmConnection(identifier) => {
+            let (read, write) = control_channel_receiver(stream);
+            Ok(ConnectionIdentification::Connection(
+                read,
+                write,
+                identifier.into(),
+            ))
+        }
+        IdentificationRequest::IAmChannel(connection_identifier, channel_identifier) => {
+            let (read, write) = data_channel_receiver(stream);
+            Ok(ConnectionIdentification::Channel(
+                read,
+                write,
+                connection_identifier.into(),
+                channel_identifier,
+            ))
+        }
+    }
 }
 
 type RegisteredChannels = Arc<RwLock<HashMap<ChannelIdentifier, (DataQueue, CancellationToken)>>>;
+type OpenedChannels = Arc<
+    RwLock<
+        HashMap<
+            (ConnectionIdentifier, ChannelIdentifier),
+            oneshot::Sender<(DataChannelReceiverReader, DataChannelReceiverWriter)>,
+        >,
+    >,
+>;
 async fn channel_handler(
     cancellation_token: CancellationToken,
     queue: &mut DataQueue,
-    listener: &mut TcpListener,
+    mut reader: DataChannelReceiverReader,
+    mut writer: DataChannelReceiverWriter,
 ) -> core::result::Result<(), ChannelHandlerError> {
-    let (stream, address) = match cancellation_token
-        .run_until_cancelled(tokio::time::timeout(
-            Duration::from_secs(3),
-            listener.accept(),
-        ))
-        .await
-    {
-        None => return Err(ChannelHandlerError::Cancelled),
-        Some(Err(_)) => return Err(ChannelHandlerError::Timeout),
-        Some(Ok(Err(e))) => return Err(ChannelHandlerError::Network(e.into())),
-        Some(Ok(Ok((stream, address)))) => (stream, address),
-    };
-
-    let (mut reader, mut writer) = data_channel_receiver(stream);
-
     let mut pending_buffer: Option<TupleBuffer> = None;
-    info!("Accepted TupleBuffer channel connection from {address}");
     loop {
         if let Some(pending_buffer) = pending_buffer.take() {
-            let sequence = pending_buffer.sequence_number;
+            let sequence = pending_buffer.sequence();
             select! {
                 _ = cancellation_token.cancelled() => return Err(ChannelHandlerError::Cancelled),
                 write_queue_result = queue.send(pending_buffer) => {
@@ -99,46 +140,32 @@ async fn channel_handler(
 }
 
 async fn create_channel_handler(
+    connector_identifier: ConnectionIdentifier,
     channel_id: ChannelIdentifier,
+    opened_channels: OpenedChannels,
     mut queue: DataQueue,
     channel_cancellation_token: CancellationToken,
     control: NetworkingServiceController,
-) -> Result<u16> {
-    let (tx, rx) = oneshot::channel::<std::result::Result<u16, Error>>();
+) {
     tokio::spawn({
         let channel = channel_id.clone();
         async move {
-            let listener = channel_cancellation_token
-                .run_until_cancelled(TcpListener::bind("0.0.0.0:0"))
-                .await;
-
-            let mut listener = match listener {
-                None => return,
-                Some(Ok(listener)) => listener,
-                Some(Err(e)) => {
-                    tx.send(Err(e.into()))
-                        .expect("BUG: Channel should not be closed.");
-                    return;
-                }
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut locked = opened_channels.write().await;
+                locked.insert((connector_identifier, channel.clone()), tx);
+            }
+            let Ok((reader, writer)) = rx.await else {
+                warn!("Channel was closed");
+                return;
             };
-
-            let port = match listener.local_addr() {
-                Ok(addr) => addr.port(),
-                Err(e) => {
-                    tx.send(Err(e.into()))
-                        .expect("BUG: Channel should not be closed.");
-                    return;
-                }
-            };
-            tx.send(Ok(port))
-                .expect("BUG: Channel should not be closed.");
-
-            Span::current().record("port", format!("{}", port));
+            info!("Open");
 
             let Err(channel_handler_error) = channel_handler(
                 channel_cancellation_token.clone(),
                 &mut queue,
-                &mut listener,
+                reader,
+                writer,
             )
             .await
             else {
@@ -152,9 +179,6 @@ async fn create_channel_handler(
                 }
                 ChannelHandlerError::Network(e) => {
                     warn!("Data Channel Stopped due to network error: {e}");
-                }
-                ChannelHandlerError::Timeout => {
-                    warn!("Data Channel Stopped due to connection timeout");
                 }
                 ChannelHandlerError::ClosedByOtherSide => {
                     info!("Data Channel Stopped");
@@ -174,20 +198,23 @@ async fn create_channel_handler(
         }
         .instrument(info_span!("channel", channel_id = %channel_id))
     });
-
-    rx.await?
-        .map_err(|_| "Could not create TupleBuffer channel listener".into())
 }
 async fn control_socket_handler(
-    stream: TcpStream,
+    mut reader: ControlChannelReceiverReader,
+    mut writer: ControlChannelReceiverWriter,
+    connection_identification: ConnectionIdentifier,
+    ports: &Vec<u16>,
     channels: RegisteredChannels,
+    opened_channels: OpenedChannels,
     control: NetworkingServiceController,
 ) -> Result<ControlChannelRequest> {
-    let (mut reader, mut writer) = control_channel_receiver(stream);
     let mut active_connection_channels = vec![];
     loop {
         let Some(Ok(message)) = reader.next().await else {
-            warn!("Connection was closed. Cancelling {} channel(s)", active_connection_channels.len());
+            warn!(
+                "Connection was closed. Cancelling {} channel(s)",
+                active_connection_channels.len()
+            );
             active_connection_channels
                 .into_iter()
                 .for_each(|t: CancellationToken| t.cancel());
@@ -204,10 +231,17 @@ async fn control_socket_handler(
                     continue;
                 };
 
-                let port =
-                    create_channel_handler(channel, emit, token.clone(), control.clone()).await?;
+                create_channel_handler(
+                    connection_identification.clone(),
+                    channel,
+                    opened_channels.clone(),
+                    emit,
+                    token.clone(),
+                    control.clone(),
+                )
+                .await;
                 writer
-                    .send(ControlChannelResponse::OkChannelResponse(port))
+                    .send(ControlChannelResponse::OkChannelResponse(ports[0]))
                     .await?;
                 active_connection_channels.push(token);
             }
@@ -218,62 +252,124 @@ async fn control_socket_handler(
 async fn control_socket(
     listener: NetworkingServiceControlListener,
     controller: NetworkingServiceController,
-    connection_identifier: ConnectionIdentifier,
+    bind_address: SocketAddr,
+    connection_identifier: ThisConnectionIdentifier,
 ) -> Result<()> {
     info!("Starting control socket: {}", connection_identifier);
-    let listener_port = TcpListener::bind(connection_identifier.parse::<SocketAddr>()?).await?;
+    let listener_port = TcpListener::bind(bind_address).await?;
     let registered_channels = Arc::new(RwLock::new(HashMap::default()));
+    let opened_channels = Arc::new(RwLock::new(HashMap::default()));
+    let receiver_span = Span::current();
 
-    info!(
-        "Control bound to {}",
-        listener_port
-            .local_addr()
-            .expect("Local address is not accessible")
+    tokio::spawn(
+        {
+            let registered_channels = registered_channels.clone();
+            let opened_channels = opened_channels.clone();
+            async move {
+                let receiver_span = receiver_span.clone();
+                let ports = vec![listener_port.local_addr().unwrap().port()];
+                loop {
+                    let Ok((stream, addr)) = listener_port.accept().await else {
+                        error!("Control socket was closed");
+                        return;
+                    };
+                    info!("Received connection from {}", addr);
+                    let identification = match identify_connection(stream).await {
+                        Ok(identification) => identification,
+                        Err(e) => {
+                            warn!("Connection identification failed: {e:?}");
+                            continue;
+                        }
+                    };
+
+                    match identification {
+                        ConnectionIdentification::Connection(reader, writer, connection) => {
+                            tokio::spawn(
+                                {
+                                    let controller = controller.clone();
+                                    let registered_channels = registered_channels.clone();
+                                    let opened_channels = opened_channels.clone();
+                                    let ports = ports.clone();
+                                    let c = connection.clone();
+                                    async move {
+                                        info!("Starting control socket handler for {c}");
+                                        let result = control_socket_handler(
+                                            reader,
+                                            writer,
+                                            c,
+                                            &ports,
+                                            registered_channels.clone(),
+                                            opened_channels.clone(),
+                                            controller.clone(),
+                                        )
+                                        .await;
+                                        info!("Control socket handler terminated: {:?}", result);
+                                    }
+                                }
+                                .instrument(info_span!(parent: receiver_span.clone(), "connection_handler",  other = %connection)),
+                            );
+                        }
+                        ConnectionIdentification::Channel(r, w, c, channel) => {
+                            let mut lock = opened_channels.write().await;
+                            let Some(sender) = lock.remove(&(c, channel)) else {
+                                error!("Channel was not registered");
+                                continue;
+                            };
+                            match sender.send((r, w)) {
+                                Ok(_) => {}
+                                Err(_) => {
+                                    warn!("Channel was already closed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .instrument(info_span!("control_socket", bind_address = %bind_address)),
     );
 
     loop {
-        select! {
-            connect = listener_port.accept() => {
-                let (stream, addr) = connect?;
-                tokio::spawn(
-                    {
-                        let channels = registered_channels.clone();
-                        let controller = controller.clone();
-                        async move {
-                            info!("Starting Connection Handler");
-                            info!("Connection Handler terminated: {:?}", control_socket_handler(stream, channels, controller).await);
-                        }.instrument(info_span!("connection", addr = %addr))
+        match listener.recv().await {
+            Err(_) => {
+                registered_channels
+                    .write()
+                    .await
+                    .iter()
+                    .for_each(|(_, (_, token))| {
+                        token.cancel();
                     });
-            },
-            control_message = listener.recv() => match control_message {
-                Err(_) => {
-                    registered_channels.write().await.iter().for_each(|(_, (_, token))|{
-                       token.cancel();
-                    });
-                    return Ok(())
-                },
-                Ok(NetworkingServiceControl::RegisterChannel(ident,emit_fn, response)) => {
-                    let token = CancellationToken::new();
-                    {
-                        let mut locked = registered_channels.write().await;
-                        locked.retain(|_, (_, token)| !token.is_cancelled());
-                        locked.insert(ident, (emit_fn, token.clone()));
-                    }
-
-                    match response.send(()) {
-                        Ok(_) => {},
-                        Err(_) => {token.cancel();}
-                    }
-                }
-                Ok(NetworkingServiceControl::RetryChannel(ident, emit_fn, token)) => {registered_channels.write().await.insert(ident, (emit_fn, token));}
+                return Ok(());
             }
-        }
+            Ok(NetworkingServiceControl::RegisterChannel(ident, emit_fn, response)) => {
+                let token = CancellationToken::new();
+                {
+                    let mut locked = registered_channels.write().await;
+                    locked.retain(|_, (_, token)| !token.is_cancelled());
+                    locked.insert(ident, (emit_fn, token.clone()));
+                }
+
+                match response.send(()) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        token.cancel();
+                    }
+                };
+            }
+            Ok(NetworkingServiceControl::RetryChannel(ident, emit_fn, token)) => {
+                registered_channels
+                    .write()
+                    .await
+                    .insert(ident, (emit_fn, token));
+            }
+        };
     }
 }
 impl NetworkService {
     pub fn start(
         runtime: Runtime,
-        connection_identifier: ConnectionIdentifier,
+        bind_address: SocketAddr,
+        connection_identifier: ThisConnectionIdentifier,
     ) -> Arc<NetworkService> {
         let (tx, rx) = async_channel::bounded(10);
         let service = Arc::new(NetworkService {
@@ -287,23 +383,31 @@ impl NetworkService {
             .expect("BUG: No one should panic while holding this lock")
             .as_ref()
             .expect("BUG: The service was just started")
-            .spawn({
-                let listener = rx;
-                let controller = tx;
-                async move {
-                    info!("Starting Control");
-                    let control_socket_result =
-                        control_socket(listener, controller, connection_identifier).await;
-                    match control_socket_result {
-                        Ok(_) => {
-                            info!("Control stopped")
-                        }
-                        Err(e) => {
-                            error!("Control stopped: {:?}", e);
+            .spawn(
+                {
+                    let listener = rx;
+                    let controller = tx;
+                    let connection_identifier = connection_identifier.clone();
+                    async move {
+                        let control_socket_result = control_socket(
+                            listener,
+                            controller,
+                            bind_address,
+                            connection_identifier,
+                        )
+                        .await;
+                        match control_socket_result {
+                            Ok(_) => {
+                                warn!("Control stopped")
+                            }
+                            Err(e) => {
+                                error!("Control stopped with error: {:?}", e);
+                            }
                         }
                     }
                 }
-            });
+                .instrument(info_span!("receiver", this = %connection_identifier)),
+            );
 
         service
     }

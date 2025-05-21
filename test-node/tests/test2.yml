@@ -1,4 +1,5 @@
-- connection: 8000
+- connection: localhost:8000
+  bind: 0.0.0.0:8000
   commands:
     - type: Wait
       millis: 1000
@@ -6,37 +7,52 @@
       q:
         type: Source
         downstream_channel: channel_1
-        downstream_connection: 8001
+        downstream_connection: localhost:8001
+        should_be_closed: false
     - type: StartQuery
       q:
         type: Source
         downstream_channel: channel_2
-        downstream_connection: 8002
+        downstream_connection: localhost:8002
+        should_be_closed: true
     - type: Wait
       millis: 10000
-- connection: 8001
+    - type: StopQuery
+      id: 0
+    - type: StopQuery
+      id: 1
+- connection: localhost:8001
+  bind: 0.0.0.0:8001
   commands:
     - type: Wait
       millis: 2000
     - type: StartQuery
       q:
-        type: bridge
+        type: Bridge
         input_channel: channel_1
         downstream_channel: channel_1
-        downstream_connection: 8003
+        downstream_connection: localhost:8003
+        should_be_closed: true
     - type: Wait
       millis: 10000
-- connection: 8002
+    - type: StopQuery
+      id: 0
+- connection: localhost:8002
+  bind: 0.0.0.0:8002
   commands:
     - type: StartQuery
       q:
-        type: bridge
+        type: Bridge
         input_channel: channel_2
         downstream_channel: channel_2
-        downstream_connection: 8003
+        downstream_connection: localhost:8003
+        should_be_closed: true
     - type: Wait
       millis: 10000
-- connection: 8003
+    - type: StopQuery
+      id: 0
+- connection: localhost:8003
+  bind: 0.0.0.0:8003
   commands:
     - type: Wait
       millis: 4000
@@ -50,3 +66,7 @@
         input_channel: channel_2
     - type: Wait
       millis: 10000
+    - type: StopQuery
+      id: 0
+    - type: StopQuery
+      id: 1

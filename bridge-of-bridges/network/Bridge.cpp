@@ -21,9 +21,14 @@
 #include <ErrorHandling.hpp>
 
 
-void init_receiver_server_string(std::string connection)
+void init_receiver_server_string(std::string bind, std::string connection)
 {
-    init_receiver_server(rust::String(std::move(connection)));
+    init_receiver_server(rust::String(std::move(bind)), rust::String(std::move(connection)));
+}
+
+void init_sender_server_string(std::string connection)
+{
+    init_sender_server(rust::String(std::move(connection)));
 }
 
 void TupleBufferBuilder::set_metadata(const SerializedTupleBuffer& metaData)
